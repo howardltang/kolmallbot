@@ -36,8 +36,12 @@ pip install requests beautifulsoup4 flask
 ## Setup
 
 1. Clone or copy the `mallbot/` directory.
-2. Edit `config.json` and fill in your KoL username and password (or leave blank to be prompted at login).
-3. Optionally configure `settings` (request delay, markup %, default stock quantity).
+2. Copy `config.example.json` to `config.json`:
+   ```bash
+   cp config.example.json config.json
+   ```
+3. Edit `config.json` and fill in your KoL username and password (or leave blank to be prompted at login).
+4. Optionally configure `settings` (request delay, markup %, default stock quantity).
 
 ### config.json structure
 

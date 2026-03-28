@@ -1,0 +1,5 @@
+config.json
+item_cache.json
+mallbot.log
+__pycache__/
+*.pyc

@@ -1,0 +1,22 @@
+{
+  "_comment": "Mall Bot Configuration — copy this file to config.json and fill in your details.",
+  "credentials": {
+    "username": "",
+    "password": ""
+  },
+  "settings": {
+    "request_delay_seconds": 1.0,
+    "mall_markup_percent": 5,
+    "default_stock_quantity": 1
+  },
+  "price_ranges": {
+    "_comment": "item_id -> {min, max, name, buy_qty}. Bot buys when price < min, lists in store when price > max.",
+    "example": {
+      "item_id": 69,
+      "name": "EXAMPLE ITEM",
+      "min_price": 100,
+      "max_price": 999999999,
+      "buy_qty": 1
+    }
+  }
+}
