@@ -36,10 +36,19 @@ _job_lock     = threading.Lock()
 _job_running  = False
 _job_lines:   List[str] = []
 _job_cancel   = threading.Event()  # set to abort any running job
+_monitor_verbose = True  # False = only emit successful buy/list messages
 
 
 def _emit(msg: str):
     _job_lines.append(str(msg))
+
+
+_QUIET_KEYWORDS = ("Bought ", "Successfully listed", "Monitor stopped", "[ERROR]", "WARNING")
+
+def _monitor_emit(msg: str):
+    """Emit for monitor job — filtered when _monitor_verbose is False."""
+    if _monitor_verbose or any(kw in msg for kw in _QUIET_KEYWORDS):
+        _emit(msg)
 
 
 # Redirect mallbot's terminal _status() calls into the web output stream.
@@ -169,7 +178,18 @@ def _do_stock(min_price: int, markup_pct: int, max_qty: int):
     _emit(f"Done. Stocked {stocked}, skipped {skipped}.")
 
 
-def _do_monitor(interval: int, undercut_pct: float = 0):
+def _do_monitor(interval: int, undercut_pct: float = 0, verbose: bool = True):
+    global _monitor_verbose
+    _monitor_verbose = verbose
+    _mall_mod._status = _monitor_emit  # type: ignore
+    try:
+        _do_monitor_inner(interval, undercut_pct)
+    finally:
+        _mall_mod._status = _emit  # type: ignore
+        _monitor_verbose = True
+
+
+def _do_monitor_inner(interval: int, undercut_pct: float = 0):
     cfg    = load_config()
     ranges = {k: v for k, v in cfg.get("price_ranges", {}).items()
               if k != "_comment" and str(k).lstrip("-").isdigit()}
@@ -180,7 +200,7 @@ def _do_monitor(interval: int, undercut_pct: float = 0):
     undercut_label = f" (undercut {undercut_pct:g}%)" if undercut_pct else ""
     _emit(f"Monitoring {len(ranges)} item(s) every {interval}s{undercut_label}. Click Stop to end.")
     while not _job_cancel.is_set():
-        _emit(f"--- {time.strftime('%H:%M:%S')} ---")
+        _monitor_emit(f"--- {time.strftime('%H:%M:%S')} ---")
         for rule in ranges.values():
             item_id = int(rule["item_id"])
             name    = rule.get("name", f"item#{item_id}")
@@ -190,18 +210,18 @@ def _do_monitor(interval: int, undercut_pct: float = 0):
 
             listings = _mall_mod._fetch_mall_listings(_session, name, exact=True)
             if not listings:
-                _emit(f"  {name}: no listings")
+                _monitor_emit(f"  {name}: no listings")
                 continue
 
             # Exclude own store listings so our own price doesn't influence comparisons
             others = [l for l in listings if str(l["store_id"]) != own_store_id] if own_store_id else listings
             if not others:
-                _emit(f"  {name}: only own store listed, skipping")
+                _monitor_emit(f"  {name}: only own store listed, skipping")
                 continue
             price = min(l["price"] for l in others)
 
             if min_p and price < min_p:
-                _emit(f"  {name}: {price:,} < min {min_p:,} → buying {buy_qty}x")
+                _monitor_emit(f"  {name}: {price:,} < min {min_p:,} → buying {buy_qty}x")
                 buy_from_mall(_session, item_id, name, buy_qty, min_p)
             elif max_p and price > max_p:
                 inv  = _session.get("api.php", params={"what": "inventory", "for": "MallBot"}).json()
@@ -209,15 +229,15 @@ def _do_monitor(interval: int, undercut_pct: float = 0):
                 if have:
                     undercut_price = int(price * (1 - undercut_pct / 100))
                     list_price     = max(max_p, undercut_price)
-                    _emit(f"  {name}: {price:,} > max {max_p:,} → listing {have}x at {list_price:,}")
+                    _monitor_emit(f"  {name}: {price:,} > max {max_p:,} → listing {have}x at {list_price:,}")
                     add_to_store(_session, item_id, have, list_price, name=name)
                 else:
-                    _emit(f"  {name}: {price:,} > max {max_p:,}, none in inventory")
+                    _monitor_emit(f"  {name}: {price:,} > max {max_p:,}, none in inventory")
             else:
                 lo = f"{min_p:,}" if min_p else "—"
                 hi = f"{max_p:,}" if max_p else "—"
-                _emit(f"  {name}: {price:,} meat  (OK, range {lo}–{hi})")
-        _emit(f"Sleeping {interval}s...")
+                _monitor_emit(f"  {name}: {price:,} meat  (OK, range {lo}–{hi})")
+        _monitor_emit(f"Sleeping {interval}s...")
         _job_cancel.wait(interval)
     _emit("Monitor stopped.")
 
@@ -462,8 +482,9 @@ def run_action(action):
         )
     elif action == "monitor":
         _start_job(_do_monitor,
-                   int(request.form.get("interval", 5) or 5),
-                   float(request.form.get("undercut_pct", 0) or 0))
+                   int(request.form.get("interval", 2) or 0),
+                   float(request.form.get("undercut_pct", 0) or 0),
+                   request.form.get("verbose", "1") != "0")
     elif action == "view_store":
         _start_job(_do_view_store)
     else:
@@ -743,10 +764,17 @@ MAIN_HTML = """<!DOCTYPE html>
             <form id="form-monitor">
               <div class="form-row">
                 <div class="field"><label>Check interval (seconds)</label>
-                  <input type="number" name="interval" value="5" min="2"></div>
+                  <input type="number" name="interval" value="2" min="0"></div>
                 <div class="field"><label>Undercut %</label>
                   <input type="number" name="undercut_pct" value="0" min="0" max="100" step="0.1" style="width:70px"></div>
-                <button type="submit" class="btn-run">Start</button>
+                <div class="field">
+                  <label>Verbose output</label>
+                  <select name="verbose" style="padding:.35rem .5rem;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#c9d1d9;font-size:.83rem;outline:none">
+                    <option value="1" selected>True</option>
+                    <option value="0">False</option>
+                  </select>
+                </div>
+                <button type="submit" id="monitor-btn-start" class="btn-run">Start</button>
               </div>
             </form>
           </div>
@@ -778,7 +806,6 @@ MAIN_HTML = """<!DOCTYPE html>
               <span>Output</span>
               <div style="display:flex;gap:.5rem;align-items:center">
                 <span id="monitor-status-badge" class="badge badge-idle">Idle</span>
-                <button id="monitor-btn-cancel" class="btn-stop hidden">Stop</button>
                 <button id="monitor-btn-clear" class="btn-clear">Clear</button>
               </div>
             </div>
@@ -1091,7 +1118,9 @@ function setMonitorRunning(running) {
   var badge = document.getElementById('monitor-status-badge');
   badge.textContent = running ? 'Running...' : 'Idle';
   badge.className = 'badge ' + (running ? 'badge-running' : 'badge-idle');
-  document.getElementById('monitor-btn-cancel').classList.toggle('hidden', !running);
+  var btn = document.getElementById('monitor-btn-start');
+  btn.textContent = running ? 'Stop' : 'Start';
+  btn.className = running ? 'btn-stop' : 'btn-run';
 }
 
 function startMonitorPolling() {
@@ -1113,6 +1142,10 @@ function startMonitorPolling() {
 
 document.getElementById('form-monitor').addEventListener('submit', function(e) {
   e.preventDefault();
+  if (monitorPollTimer) {
+    fetch('/run/cancel', { method: 'POST', body: new URLSearchParams() });
+    return;
+  }
   document.getElementById('monitor-output-box').textContent = '';
   monitorLinesFrom = 0;
   var body = new URLSearchParams(new FormData(e.target));
@@ -1122,10 +1155,6 @@ document.getElementById('form-monitor').addEventListener('submit', function(e) {
       if (!res.ok) { appendMonitorLines(['ERROR: ' + (res.data.error || 'unknown')]); return; }
       startMonitorPolling();
     });
-});
-
-document.getElementById('monitor-btn-cancel').addEventListener('click', function() {
-  fetch('/run/cancel', { method: 'POST', body: new URLSearchParams() });
 });
 
 document.getElementById('monitor-btn-clear').addEventListener('click', function() {

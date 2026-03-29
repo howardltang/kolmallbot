@@ -441,10 +441,30 @@ def remove_from_store(session: KoLSession, item_id: int, quantity: int) -> bool:
     return ok
 
 
+def _parse_acquired(html: str) -> int:
+    """Return the number of items actually acquired from a KoL purchase response.
+
+    KoL formats:
+      single: You acquire an item: <b>Name</b>
+      multi:  You acquire some items: <b>Name</b> (N)
+    """
+    # Multi-item: (N) appears right after the bold item name in an acquire message
+    m = re.search(r'acquire[^<]*<b>[^<]+</b>\s*\((\d+)\)', html, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    # Single item
+    if re.search(r'acquire an item', html, re.IGNORECASE):
+        return 1
+    # Fallback: acquire mentioned but format unrecognised
+    if re.search(r'acquire', html, re.IGNORECASE):
+        return 1
+    return 0
+
+
 def buy_from_mall(session: KoLSession, item_id: int, item_name: str,
                   quantity: int, max_price: int) -> bool:
-    """Search the mall by name, find the cheapest listing, and buy as many as
-    affordable up to quantity, provided the price is within max_price."""
+    """Search the mall by name, iterate listings cheapest-first, and buy up to
+    quantity units within max_price, skipping stores whose limit is exhausted."""
     _status(f"    Searching mall for '{item_name}' ...")
     listings = _fetch_mall_listings(session, item_name, exact=True)
 
@@ -453,46 +473,96 @@ def buy_from_mall(session: KoLSession, item_id: int, item_name: str,
         logger.warning(f"buy_from_mall: no listings for '{item_name}' (#{item_id})")
         return False
 
-    cheapest = min(listings, key=lambda x: x["price"])
-    price          = cheapest["price"]
-    store_id       = cheapest["store_id"]
-    search_item_id = cheapest["search_item_id"]
-
-    if price > max_price:
-        _status(f"    Cheapest price {price:,} exceeds max {max_price:,} — skipping.")
-        logger.info(f"buy_from_mall: price {price} > max {max_price}, skipping")
+    affordable_listings = [l for l in listings if l["price"] <= max_price]
+    if not affordable_listings:
+        cheapest_price = min(l["price"] for l in listings)
+        _status(f"    Cheapest price {cheapest_price:,} exceeds max {max_price:,} — skipping.")
+        logger.info(f"buy_from_mall: price {cheapest_price} > max {max_price}, skipping")
         return False
 
-    # Check meat balance and cap quantity to what we can afford
+    affordable_listings.sort(key=lambda x: x["price"])
+
+    # Fetch meat balance once before iterating
     status = session.get("api.php", params={"what": "status", "for": "MallBot"}).json()
     if "pwd" in status:
         session.pwd_hash = status["pwd"]
     meat = int(status.get("meat", 0))
-    affordable = min(quantity, meat // price)
-    if affordable <= 0:
-        _status(f"    Not enough meat to buy '{item_name}' at {price:,} "
-                f"(have {meat:,}, need {price:,}).")
-        logger.info(f"buy_from_mall: insufficient meat {meat} for price {price}")
-        return False
-    if affordable < quantity:
-        _status(f"    Only enough meat for {affordable}x (have {meat:,}, "
-                f"need {price * quantity:,}) — buying {affordable}x instead.")
 
-    _status(f"    Found at {price:,} meat. Buying {affordable}x ...")
-    resp2 = session.post("mallstore.php", data={
-        "pwd":        session.pwd_hash,
-        "buying":     1,
-        "whichstore": store_id,
-        "whichitem":  f"{search_item_id}.{price}",
-        "quantity":   affordable,
-    })
-    ok = "acquire" in resp2.text.lower()
-    if ok:
-        _status(f"    Bought {affordable}x '{item_name}' at {price:,} meat each.")
-    else:
-        _status(f"    WARNING: Purchase of '{item_name}' may have failed.")
-    logger.info(f"buy_from_mall '{item_name}' (#{item_id}) qty={affordable} price={price} ok={ok}")
-    return ok
+    remaining = quantity
+    any_bought = False
+
+    for listing in affordable_listings:
+        if remaining <= 0:
+            break
+        if meat <= 0:
+            _status(f"    Out of meat — stopping.")
+            break
+
+        price          = listing["price"]
+        store_id       = listing["store_id"]
+        search_item_id = listing["search_item_id"]
+
+        # Cap by this listing's per-day purchase limit (0 = unlimited)
+        listing_limit = listing["limit"]
+        capped = min(remaining, listing_limit) if listing_limit > 0 else remaining
+
+        # Cap by what we can currently afford
+        can_afford = min(capped, meat // price)
+        if can_afford <= 0:
+            _status(f"    Not enough meat for 1x at {price:,} (have {meat:,}) — stopping.")
+            break
+        if can_afford < capped:
+            _status(f"    Only enough meat for {can_afford}x at {price:,} (have {meat:,}).")
+
+        _status(f"    Buying {can_afford}x at {price:,} meat (store {store_id}) ...")
+        resp = session.post("mallstore.php", data={
+            "pwd":        session.pwd_hash,
+            "buying":     1,
+            "whichstore": store_id,
+            "whichitem":  f"{search_item_id}.{price}",
+            "quantity":   can_afford,
+        })
+        acquired = _parse_acquired(resp.text)
+        ok = acquired > 0
+        # Log a snippet around "acquire" to help diagnose parse failures
+        m = re.search(r'.{0,80}acquire.{0,80}', resp.text, re.IGNORECASE | re.DOTALL)
+        logger.debug(f"buy_from_mall acquire snippet: {m.group(0)!r}" if m else "buy_from_mall: no 'acquire' in response")
+        logger.info(f"buy_from_mall '{item_name}' store={store_id} qty={can_afford} acquired={acquired} price={price} ok={ok}")
+
+        if ok:
+            _status(f"    Bought {acquired}x '{item_name}' at {price:,} meat each.")
+            remaining -= acquired
+            meat      -= acquired * price
+            any_bought = True
+        elif listing_limit > 0 and can_afford > 1:
+            # Purchase limit may be partially exhausted (e.g. limit raised after prior buys).
+            # Retry with qty=1 to buy whatever remains of the daily allowance.
+            _status(f"    Full quantity failed — retrying with 1x (partial limit remaining?) ...")
+            resp2 = session.post("mallstore.php", data={
+                "pwd":        session.pwd_hash,
+                "buying":     1,
+                "whichstore": store_id,
+                "whichitem":  f"{search_item_id}.{price}",
+                "quantity":   1,
+            })
+            acquired2 = _parse_acquired(resp2.text)
+            ok2 = acquired2 > 0
+            logger.info(f"buy_from_mall '{item_name}' store={store_id} qty=1 (retry) acquired={acquired2} price={price} ok={ok2}")
+            if ok2:
+                _status(f"    Bought {acquired2}x '{item_name}' at {price:,} meat each.")
+                remaining -= acquired2
+                meat      -= acquired2 * price
+                any_bought = True
+            else:
+                _status(f"    Store {store_id} limit exhausted — trying next store.")
+                logger.warning(f"buy_from_mall: store {store_id} limit exhausted, moving on")
+        else:
+            _status(f"    Purchase from store {store_id} failed (limit likely reached) — trying next store.")
+            logger.warning(f"buy_from_mall: purchase failed for store {store_id}, trying next listing")
+
+    if not any_bought:
+        _status(f"    WARNING: Could not buy any '{item_name}' — all listings may be limit-reached.")
+    return any_bought
 
 
 # ---------------------------------------------------------------------------
