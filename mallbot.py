@@ -11,6 +11,7 @@ import time
 import getpass
 import logging
 import sys
+import threading
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 
@@ -75,30 +76,53 @@ class KoLSession:
         self.logged_in = False
         self.pwd_hash:  Optional[str] = None
         self.player_id: Optional[str] = None
-        self._last_req = 0.0
+        self._last_req  = 0.0
+        self._throttle_lock = threading.Lock()
 
     def _throttle(self):
-        elapsed = time.time() - self._last_req
-        if elapsed < self.delay:
-            time.sleep(self.delay - elapsed)
-        self._last_req = time.time()
+        with self._throttle_lock:
+            elapsed = time.time() - self._last_req
+            if elapsed < self.delay:
+                time.sleep(self.delay - elapsed)
+            self._last_req = time.time()
 
     def get(self, path: str, params: Optional[Dict] = None) -> requests.Response:
         self._throttle()
         resp = self._session.get(f"{KOL_BASE}/{path}", params=params, timeout=30)
         resp.raise_for_status()
+        if self.logged_in and (
+            "login.php" in resp.url or
+            ("login.php" in resp.text[:500] and "loginname" in resp.text[:500])
+        ):
+            self._relogin()
         return resp
 
     def post(self, path: str, data: Optional[Dict] = None) -> requests.Response:
         self._throttle()
         resp = self._session.post(f"{KOL_BASE}/{path}", data=data, timeout=30)
         resp.raise_for_status()
+        if self.logged_in and (
+            "login.php" in resp.url or
+            ("login.php" in resp.text[:500] and "loginname" in resp.text[:500])
+        ):
+            self._relogin()
         return resp
+
+    def _relogin(self):
+        logger.warning("Session expired — attempting re-login.")
+        _status("  Session expired — re-logging in...")
+        self.logged_in = False
+        if self.login():
+            _status("  Re-login successful.")
+            logger.info("Re-login successful after session expiry.")
+        else:
+            logger.error("Re-login failed after session expiry.")
+            raise RuntimeError("KoL session expired and re-login failed.")
 
     def login(self) -> bool:
         print("  Connecting to Kingdom of Loathing ...")
-        self.get("login.php")
-        resp = self.post("login.php", data={
+        self._session.get(f"{KOL_BASE}/login.php", timeout=30)
+        resp = self._session.post(f"{KOL_BASE}/login.php", data={
             "loggingin": "Yup.",
             "loginname": self.username,
             "password":  self.password,
@@ -309,16 +333,26 @@ def _fetch_mall_listings(session: KoLSession, item_name: str,
                     limit = int(digits)
                 break
 
+        # Quantity: td with class ["small", "stock"]
+        qty = 0
+        stock_td = row.find("td", class_="stock")
+        if stock_td:
+            digits = re.sub(r'\D', '', stock_td.get_text())
+            if digits:
+                qty = int(digits)
+
         siid = sitem_m.group(1)
         listing = {
             "price":          int(price_m.group(1)),
+            "quantity":       qty,
             "limit":          limit,
             "store_id":       store_m.group(1),
             "search_item_id": siid,
             "item_name":      item_names.get(siid, ""),
         }
-        logger.debug(f"  listing: price={listing['price']:,}  limit={listing['limit']}  "
-                     f"store={listing['store_id']}  searchitem={listing['search_item_id']}")
+        logger.debug(f"  listing: price={listing['price']:,}  qty={listing['quantity']}  "
+                     f"limit={listing['limit']}  store={listing['store_id']}  "
+                     f"searchitem={listing['search_item_id']}")
         listings.append(listing)
 
     logger.debug(f"  → {len(listings)} listing(s) parsed for '{item_name}'")
@@ -332,10 +366,16 @@ def get_mall_price(session: KoLSession, item_id: int, item_name: str) -> Dict:
     min_unlimited — lowest price among listings with no purchase limit.
                     None if every listing has a limit (or there are no listings).
     """
-    listings = _fetch_mall_listings(session, item_name)
+    listings = _fetch_mall_listings(session, item_name, exact=True)
     if not listings:
         logger.warning(f"No mall listings found for '{item_name}' (#{item_id}).")
         return {"min_price": None, "min_unlimited": None}
+
+    # Filter to only listings matching this item_id in case the exact search
+    # still returns multiple items (e.g. partial name overlap)
+    own = [l for l in listings if str(l["search_item_id"]) == str(item_id)]
+    if own:
+        listings = own
 
     min_price = min(l["price"] for l in listings)
     unlimited = [l["price"] for l in listings if l["limit"] == 0]
@@ -419,10 +459,36 @@ def add_to_store(session: KoLSession, item_id: int, quantity: int,
     ok = "can't stock" not in lower and "can not stock" not in lower and \
          "not an item you can stock" not in lower and "error" not in lower[:500]
     if ok:
-        _status(f"    Successfully listed {label}.")
+        _status(f"    Successfully listed {quantity}x {label} at {price:,} meat.")
     else:
         _status(f"    WARNING: Listing {label} may have failed — check your store.")
     logger.info(f"add_to_store item#{item_id} qty={quantity} price={price} ok={ok}")
+    return ok
+
+
+def reprice_in_store(session: KoLSession, item_id: int, new_price: int,
+                     purchase_limit: int = 0, name: str = "") -> bool:
+    label = name or f"item#{item_id}"
+    _status(f"    Repricing {label} to {new_price:,} meat ...")
+    resp = session.post("backoffice.php", data={
+        "pwd":                  session.pwd_hash,
+        "action":               "updateprices",
+        f"price[{item_id}]":    new_price,
+        f"limit[{item_id}]":    purchase_limit,
+    })
+    # Log all buttons/inputs in the stock form
+    stock_start = resp.text.find('id="stock"')
+    stock_end   = resp.text.find('</form>', stock_start)
+    stock_form  = resp.text[stock_start:stock_end].replace('\n', ' ')
+    all_inputs = __import__('re').findall(r'<(?:input|button)[^>]*>', stock_form)
+    logger.debug(f"reprice_in_store stock form all inputs/buttons: {all_inputs}")
+    lower = resp.text.lower()
+    ok = "error" not in lower[:500] and "can't" not in lower[:500]
+    if ok:
+        _status(f"    Repriced {label} to {new_price:,} meat.")
+    else:
+        _status(f"    WARNING: Repricing {label} may have failed — check your store.")
+    logger.info(f"reprice_in_store item#{item_id} price={new_price} ok={ok}")
     return ok
 
 
@@ -446,10 +512,10 @@ def _parse_acquired(html: str) -> int:
 
     KoL formats:
       single: You acquire an item: <b>Name</b>
-      multi:  You acquire some items: <b>Name</b> (N)
+      multi:  You acquire <b>N Name</b>  (number is inside the <b> tag)
     """
-    # Multi-item: (N) appears right after the bold item name in an acquire message
-    m = re.search(r'acquire[^<]*<b>[^<]+</b>\s*\((\d+)\)', html, re.IGNORECASE)
+    # Multi-item: number is the first thing inside the <b> tag
+    m = re.search(r'acquire\s+<b>(\d+)\s+', html, re.IGNORECASE)
     if m:
         return int(m.group(1))
     # Single item
@@ -461,35 +527,136 @@ def _parse_acquired(html: str) -> int:
     return 0
 
 
+def evaluate_snipe(listings: List[Dict],
+                   snipe_threshold: int = 700_000,
+                   max_vol_a: int = 5,
+                   max_combined_vol_c: int = 4,
+                   max_stores_c: int = 4) -> Optional[Dict]:
+    """
+    Evaluate a list of mall listings for snipe opportunities.
+    Returns a dict describing the action to take, or None if no snipe.
+
+    Priority: Scenario M > A > B.
+
+    Scenario M: P1 <= P2 * 0.5 (mislisting at 50% or less of next price)
+      → buy entire P1 listing regardless of quantity, relist at P2-1000
+
+    Scenario A: cheapest N consecutive listings (up to max_stores_c) all
+      >= snipe_threshold below listing N+1, combined vol <= max_combined_vol_c
+      (N=1: vol <= max_vol_a)
+      → buy/reprice all N listings, relist at listing N+1 - 1000
+
+    Scenario B: vol(P1) <= 2, P2-P1 >= snipe_threshold*0.7, vol(P2) <= 3, P3-P1 >= snipe_threshold
+      → buy/reprice P1 only, relist at P2-1000
+
+    Returns dict with keys:
+      scenario   : "M", "A", or "B"
+      buy        : list of listing dicts to buy/reprice (in order)
+      relist_at  : price to relist at
+      reason     : human-readable description
+
+    Own store listings are NOT excluded — the caller is responsible for
+    repricing own listings rather than buying them.
+    """
+    others = listings
+    if len(others) < 2:
+        return None
+
+    # --- Scenario M (mislisting: P1 <= 50% of P2, buy all regardless of qty) ---
+    p1_m = others[0]["price"]
+    p2_m = others[1]["price"]
+    if p1_m > 0 and p1_m <= p2_m * 0.5:
+        relist = p2_m - 1000
+        return {
+            "scenario":  "M",
+            "buy":       [others[0]],
+            "relist_at": relist,
+            "reason":    f"Scenario M: {p1_m:,}(x{others[0]['quantity']}) is <=50% of next "
+                         f"{p2_m:,} → relist at {relist:,}",
+        }
+
+    # --- Scenario A ---
+    # Find the longest run of cheapest N stores where all are >= snipe_threshold
+    # below store N+1, combined vol <= max_combined_vol_c (or N=1 with vol<=max_vol_a)
+    for n in range(min(max_stores_c, len(others) - 1), 0, -1):
+        group    = others[:n]
+        next_l   = others[n]
+        combined_vol = sum(l["quantity"] for l in group)
+        all_below    = all(next_l["price"] - l["price"] >= snipe_threshold for l in group)
+        vol_ok       = combined_vol <= (max_vol_a if n == 1 else max_combined_vol_c)
+        if all_below and vol_ok:
+            relist = next_l["price"] - 1000
+            prices = [f"{l['price']:,}(x{l['quantity']})" for l in group]
+            return {
+                "scenario":  "A",
+                "buy":       group,
+                "relist_at": relist,
+                "reason":    f"Scenario A: {'+'.join(prices)} "
+                             f"vs next {next_l['price']:,} (gap>={snipe_threshold//1000}k) "
+                             f"→ relist at {relist:,}",
+            }
+
+    # --- Scenario B ---
+    if len(others) >= 3:
+        p1, q1 = others[0]["price"], others[0]["quantity"]
+        p2, q2 = others[1]["price"], others[1]["quantity"]
+        p3     = others[2]["price"]
+        if (q1 <= 2 and (p2 - p1) >= int(snipe_threshold * 0.7) and q2 <= 3
+                and (p3 - p1) >= snipe_threshold):
+            relist = p2 - 1000
+            return {
+                "scenario":  "B",
+                "buy":       [others[0]],
+                "relist_at": relist,
+                "reason":    f"Scenario B: P1={p1:,}(x{q1}) P2={p2:,}(x{q2}) P3={p3:,} "
+                             f"→ buy P1, relist at {relist:,}",
+            }
+
+    return None
+
+
 def buy_from_mall(session: KoLSession, item_id: int, item_name: str,
-                  quantity: int, max_price: int) -> bool:
+                  quantity: int, max_price: int,
+                  available_meat: Optional[int] = None,
+                  purchase_tracker: Optional[Dict] = None) -> Dict:
     """Search the mall by name, iterate listings cheapest-first, and buy up to
-    quantity units within max_price, skipping stores whose limit is exhausted."""
+    quantity units within max_price.
+
+    purchase_tracker maps (store_id, search_item_id) -> qty bought today.
+    When provided, stores whose daily limit is already reached are skipped and
+    the exact remaining allowance is used — no fallback retry needed.
+
+    Returns {"acquired": N, "spent": M}.
+    """
     _status(f"    Searching mall for '{item_name}' ...")
     listings = _fetch_mall_listings(session, item_name, exact=True)
 
     if not listings:
         _status(f"    No mall listings found for '{item_name}'.")
         logger.warning(f"buy_from_mall: no listings for '{item_name}' (#{item_id})")
-        return False
+        return {"acquired": 0, "spent": 0}
 
     affordable_listings = [l for l in listings if l["price"] <= max_price]
     if not affordable_listings:
         cheapest_price = min(l["price"] for l in listings)
         _status(f"    Cheapest price {cheapest_price:,} exceeds max {max_price:,} — skipping.")
         logger.info(f"buy_from_mall: price {cheapest_price} > max {max_price}, skipping")
-        return False
+        return {"acquired": 0, "spent": 0}
 
     affordable_listings.sort(key=lambda x: x["price"])
 
-    # Fetch meat balance once before iterating
-    status = session.get("api.php", params={"what": "status", "for": "MallBot"}).json()
-    if "pwd" in status:
-        session.pwd_hash = status["pwd"]
-    meat = int(status.get("meat", 0))
+    if available_meat is None:
+        status = session.get("api.php", params={"what": "status", "for": "MallBot"}).json()
+        if "pwd" in status:
+            session.pwd_hash = status["pwd"]
+        meat = int(status.get("meat", 0))
+    else:
+        meat = available_meat
 
-    remaining = quantity
-    any_bought = False
+    remaining      = quantity
+    any_bought     = False
+    total_acquired = 0
+    total_spent    = 0
 
     for listing in affordable_listings:
         if remaining <= 0:
@@ -501,10 +668,19 @@ def buy_from_mall(session: KoLSession, item_id: int, item_name: str,
         price          = listing["price"]
         store_id       = listing["store_id"]
         search_item_id = listing["search_item_id"]
+        listing_limit  = listing["limit"]
+        tracker_key    = (store_id, search_item_id)
 
-        # Cap by this listing's per-day purchase limit (0 = unlimited)
-        listing_limit = listing["limit"]
-        capped = min(remaining, listing_limit) if listing_limit > 0 else remaining
+        # Determine how many we can still buy from this store today
+        if listing_limit > 0:
+            already_bought   = purchase_tracker.get(tracker_key, 0) if purchase_tracker is not None else 0
+            limit_remaining  = listing_limit - already_bought
+            if limit_remaining <= 0:
+                logger.debug(f"buy_from_mall: skipping store {store_id} — daily limit {listing_limit} reached")
+                continue
+            capped = min(remaining, limit_remaining)
+        else:
+            capped = remaining
 
         # Cap by what we can currently afford
         can_afford = min(capped, meat // price)
@@ -524,45 +700,29 @@ def buy_from_mall(session: KoLSession, item_id: int, item_name: str,
         })
         acquired = _parse_acquired(resp.text)
         ok = acquired > 0
-        # Log a snippet around "acquire" to help diagnose parse failures
         m = re.search(r'.{0,80}acquire.{0,80}', resp.text, re.IGNORECASE | re.DOTALL)
         logger.debug(f"buy_from_mall acquire snippet: {m.group(0)!r}" if m else "buy_from_mall: no 'acquire' in response")
         logger.info(f"buy_from_mall '{item_name}' store={store_id} qty={can_afford} acquired={acquired} price={price} ok={ok}")
 
         if ok:
             _status(f"    Bought {acquired}x '{item_name}' at {price:,} meat each.")
-            remaining -= acquired
-            meat      -= acquired * price
-            any_bought = True
-        elif listing_limit > 0 and can_afford > 1:
-            # Purchase limit may be partially exhausted (e.g. limit raised after prior buys).
-            # Retry with qty=1 to buy whatever remains of the daily allowance.
-            _status(f"    Full quantity failed — retrying with 1x (partial limit remaining?) ...")
-            resp2 = session.post("mallstore.php", data={
-                "pwd":        session.pwd_hash,
-                "buying":     1,
-                "whichstore": store_id,
-                "whichitem":  f"{search_item_id}.{price}",
-                "quantity":   1,
-            })
-            acquired2 = _parse_acquired(resp2.text)
-            ok2 = acquired2 > 0
-            logger.info(f"buy_from_mall '{item_name}' store={store_id} qty=1 (retry) acquired={acquired2} price={price} ok={ok2}")
-            if ok2:
-                _status(f"    Bought {acquired2}x '{item_name}' at {price:,} meat each.")
-                remaining -= acquired2
-                meat      -= acquired2 * price
-                any_bought = True
-            else:
-                _status(f"    Store {store_id} limit exhausted — trying next store.")
-                logger.warning(f"buy_from_mall: store {store_id} limit exhausted, moving on")
+            remaining      -= acquired
+            meat           -= acquired * price
+            total_acquired += acquired
+            total_spent    += acquired * price
+            any_bought      = True
+            if purchase_tracker is not None and listing_limit > 0:
+                purchase_tracker[tracker_key] = purchase_tracker.get(tracker_key, 0) + acquired
         else:
-            _status(f"    Purchase from store {store_id} failed (limit likely reached) — trying next store.")
+            _status(f"    Purchase from store {store_id} failed — trying next store.")
             logger.warning(f"buy_from_mall: purchase failed for store {store_id}, trying next listing")
+            # Mark this store's limit as exhausted so future cycles skip it immediately
+            if purchase_tracker is not None and listing_limit > 0:
+                purchase_tracker[tracker_key] = listing_limit
 
     if not any_bought:
         _status(f"    WARNING: Could not buy any '{item_name}' — all listings may be limit-reached.")
-    return any_bought
+    return {"acquired": total_acquired, "spent": total_spent}
 
 
 # ---------------------------------------------------------------------------

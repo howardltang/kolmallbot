@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>KoL Mall Bot — Login</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0d1117; color: #c9d1d9; font-family: system-ui, sans-serif;
+           min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 10px;
+            padding: 2rem; width: 360px; }
+    h3 { color: #58a6ff; text-align: center; margin-bottom: 1.5rem; font-size: 1.3rem; }
+    label { display: block; font-size: .8rem; color: #8b949e; margin-bottom: .3rem; }
+    input { width: 100%; padding: .5rem .7rem; background: #0d1117; border: 1px solid #30363d;
+            border-radius: 5px; color: #c9d1d9; font-size: .9rem; outline: none; }
+    input:focus { border-color: #58a6ff; }
+    .field { margin-bottom: 1rem; }
+    button { width: 100%; padding: .6rem; background: #238636; border: none; border-radius: 5px;
+             color: #fff; font-size: .95rem; cursor: pointer; margin-top: .5rem; }
+    button:hover { background: #2ea043; }
+    .error { background: #3d1a1a; color: #f0a0a0; border: 1px solid #7a2020;
+             border-radius: 5px; padding: .6rem .8rem; font-size: .85rem; margin-bottom: 1rem; }
+  </style>
+</head>
+<body>
+<div class="card">
+  <h3>⚔️ KoL Mall Bot</h3>
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  <form method="POST" action="/login">
+    <div class="field"><label>Username</label><input type="text" name="username" autofocus></div>
+    <div class="field"><label>Password</label><input type="password" name="password"></div>
+    <button type="submit">Log In</button>
+  </form>
+</div>
+</body>
+</html>

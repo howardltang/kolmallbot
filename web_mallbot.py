@@ -4,17 +4,21 @@ Run:   python web_mallbot.py
 Open:  http://localhost:5000
 """
 import os, sys, json, threading, time, traceback
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests as _requests
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict
 
 from flask import (Flask, request, session as fs, Response,
-                   redirect, url_for, jsonify, render_template_string)
+                   redirect, url_for, jsonify, render_template)
 
 sys.path.insert(0, str(Path(__file__).parent))
 from mallbot import (
     KoLSession, ItemCache,
-    get_mall_price, buy_from_mall, add_to_store, get_my_store,
-    load_config, save_config,
+    get_mall_price, buy_from_mall, add_to_store, remove_from_store, reprice_in_store, get_my_store,
+    load_config, save_config, evaluate_snipe,
 )
 import mallbot as _mall_mod
 
@@ -34,6 +38,97 @@ _store_snapshot: list = []  # last-fetched store listings
 
 _job_lock     = threading.Lock()
 _job_running  = False
+
+# ---------------------------------------------------------------------------
+# Price data recorder — writes snipe-item mall listings each monitor cycle
+# ---------------------------------------------------------------------------
+_PRICE_DATA_PATH = Path(__file__).parent / "price_data.jsonl"
+
+# Price data collector (disabled — replaced by in-loop recording)
+# ---------------------------------------------------------------------------
+# _PRICE_DATA_PATH   = Path(__file__).parent / "price_data.jsonl"
+# _PRICEGUN_ITEMS    = {194: "Mr. Accessory"}   # item_id -> name; add more as needed
+# _COLLECTOR_STOP    = threading.Event()
+# _collector_thread  = None
+# _COLLECTOR_SESSION = _requests.Session()       # separate session for external requests
+#
+#
+# def _run_collector(mall_interval: int = 60, pricegun_interval: int = 3600):
+#     """Background thread: fetches mall listings every `mall_interval` seconds and
+#     pricegun trade history every `pricegun_interval` seconds (new trades only)."""
+#     import logging as _logging
+#     log = _logging.getLogger("mallbot")
+#     log.info("Price data collector started.")
+#
+#     last_pricegun_fetch = 0.0
+#     last_seen_trade_ts  = {iid: "" for iid in _PRICEGUN_ITEMS}
+#
+#     while not _COLLECTOR_STOP.wait(mall_interval):
+#         if _session is None:
+#             continue
+#         now = time.time()
+#         ts  = datetime.now().isoformat(timespec="seconds")
+#         do_pricegun = (now - last_pricegun_fetch) >= pricegun_interval
+#
+#         for item_id, name in _PRICEGUN_ITEMS.items():
+#             entry = {"ts": ts}
+#
+#             try:
+#                 listings = _mall_mod._fetch_mall_listings(_session, name, exact=True)
+#                 entry["mall_listings"] = [
+#                     {"price": l["price"], "quantity": l["quantity"],
+#                      "store_id": l["store_id"], "limit": l["limit"]}
+#                     for l in listings[:10]
+#                 ]
+#             except Exception as e:
+#                 log.warning(f"Collector: mall fetch failed for {name}: {e}")
+#
+#             if do_pricegun:
+#                 try:
+#                     resp = _COLLECTOR_SESSION.get(
+#                         f"https://pricegun.loathers.net/api/{item_id}", timeout=15)
+#                     if resp.ok:
+#                         data  = resp.json()
+#                         sales = data.get("sales", [])
+#                         cutoff = last_seen_trade_ts[item_id]
+#                         new_trades = [
+#                             {
+#                                 "date":      s["date"],
+#                                 "unitPrice": float(s["unitPrice"]["__decimal__"])
+#                                              if isinstance(s["unitPrice"], dict)
+#                                              else s["unitPrice"],
+#                                 "quantity":  s["quantity"],
+#                             }
+#                             for s in sales
+#                             if s["date"] > cutoff
+#                         ]
+#                         if new_trades:
+#                             entry["new_trades"] = new_trades
+#                             last_seen_trade_ts[item_id] = max(s["date"] for s in new_trades)
+#                 except Exception as e:
+#                     log.warning(f"Collector: pricegun fetch failed for {name}: {e}")
+#
+#             try:
+#                 with open(_PRICE_DATA_PATH, "a") as f:
+#                     f.write(json.dumps({str(item_id): entry}) + "\n")
+#             except Exception as e:
+#                 log.warning(f"Collector: failed to write price_data.jsonl: {e}")
+#
+#         if do_pricegun:
+#             last_pricegun_fetch = now
+#
+#     log.info("Price data collector stopped.")
+#
+#
+# def _start_collector():
+#     global _collector_thread
+#     _COLLECTOR_STOP.clear()
+#     _collector_thread = threading.Thread(target=_run_collector, daemon=True, name="price-collector")
+#     _collector_thread.start()
+#
+#
+# def _stop_collector():
+#     _COLLECTOR_STOP.set()
 _job_lines:   List[str] = []
 _job_cancel   = threading.Event()  # set to abort any running job
 _monitor_verbose = True  # False = only emit successful buy/list messages
@@ -43,12 +138,14 @@ def _emit(msg: str):
     _job_lines.append(str(msg))
 
 
-_QUIET_KEYWORDS = ("Bought ", "Successfully listed", "Monitor stopped", "[ERROR]", "WARNING")
+_QUIET_KEYWORDS = ("Bought ", "Successfully listed", "Monitor stopped", "[ERROR]", "WARNING: Listing")
 
 def _monitor_emit(msg: str):
     """Emit for monitor job — filtered when _monitor_verbose is False."""
-    if _monitor_verbose or any(kw in msg for kw in _QUIET_KEYWORDS):
+    if _monitor_verbose:
         _emit(msg)
+    elif any(kw in msg for kw in _QUIET_KEYWORDS):
+        _emit(f"[{time.strftime('%H:%M:%S')}] {msg.strip()}")
 
 
 # Redirect mallbot's terminal _status() calls into the web output stream.
@@ -178,18 +275,27 @@ def _do_stock(min_price: int, markup_pct: int, max_qty: int):
     _emit(f"Done. Stocked {stocked}, skipped {skipped}.")
 
 
-def _do_monitor(interval: int, undercut_pct: float = 0, verbose: bool = True):
+def _do_monitor(interval: int, undercut_pct: float = 0, verbose: bool = True,
+                max_workers: int = 5, snipe_threshold: int = 700_000):
     global _monitor_verbose
     _monitor_verbose = verbose
     _mall_mod._status = _monitor_emit  # type: ignore
+    # Build snipe item list from config
+    cfg = load_config()
+    snipe_cfg   = cfg.get("snipe_items", {})
+    snipe_items = [v for k, v in snipe_cfg.items()
+                   if k != "_comment" and str(k).lstrip("-").isdigit()] if snipe_cfg else None
     try:
-        _do_monitor_inner(interval, undercut_pct)
+        _do_monitor_inner(interval, undercut_pct, max_workers,
+                          snipe_items=snipe_items, snipe_threshold=snipe_threshold)
     finally:
         _mall_mod._status = _emit  # type: ignore
         _monitor_verbose = True
 
 
-def _do_monitor_inner(interval: int, undercut_pct: float = 0):
+def _do_monitor_inner(interval: int, undercut_pct: float = 0, max_workers: int = 5,
+                      snipe_items: Optional[List[Dict]] = None,
+                      snipe_threshold: int = 700_000):
     cfg    = load_config()
     ranges = {k: v for k, v in cfg.get("price_ranges", {}).items()
               if k != "_comment" and str(k).lstrip("-").isdigit()}
@@ -198,45 +304,262 @@ def _do_monitor_inner(interval: int, undercut_pct: float = 0):
         return
     own_store_id = str(_session.player_id) if _session.player_id else None
     undercut_label = f" (undercut {undercut_pct:g}%)" if undercut_pct else ""
+
+    # Fetch inventory and meat balance once; keep them updated after each transaction.
+    _emit("Fetching initial inventory and meat balance...")
+    status = _session.get("api.php", params={"what": "status", "for": "MallBot"}).json()
+    if "pwd" in status:
+        _session.pwd_hash = status["pwd"]
+    meat = int(status.get("meat", 0))
+    inv_raw = _session.get("api.php", params={"what": "inventory", "for": "MallBot"}).json()
+    inventory = {int(k): int(v) for k, v in inv_raw.items()}
+    _emit(f"Meat: {meat:,} | {len(inventory)} item type(s) in inventory.")
+
+    _KOL_TZ = ZoneInfo('America/Los_Angeles')
+
+    def _kol_day() -> str:
+        """Return a string identifying the current KoL day.
+        KoL rollover is at 8:30 PM PST; we reset at 8:32 PM to allow for slight delays.
+        Achieved by shifting the clock back 20h32m so midnight of the shifted time
+        coincides with 8:32 PM PST."""
+        from datetime import timedelta
+        return (datetime.now(_KOL_TZ) - timedelta(hours=20, minutes=32)).strftime('%Y-%m-%d')
+
+    purchase_tracker: Dict = {}
+    tracker_date = _kol_day()
+
     _emit(f"Monitoring {len(ranges)} item(s) every {interval}s{undercut_label}. Click Stop to end.")
     while not _job_cancel.is_set():
+        # Reset purchase tracker after KoL rollover (8:32 PST)
+        today = _kol_day()
+        if today != tracker_date:
+            _emit(f"  Rollover detected ({today}) — purchase tracker reset.")
+            purchase_tracker.clear()
+            tracker_date = today
+
         _monitor_emit(f"--- {time.strftime('%H:%M:%S')} ---")
-        for rule in ranges.values():
+        # Refresh meat balance and inventory each cycle to stay in sync with reality
+        try:
+            status = _session.get("api.php", params={"what": "status", "for": "MallBot"}).json()
+            if "pwd" in status:
+                _session.pwd_hash = status["pwd"]
+            meat = int(status.get("meat", 0))
+            inv_resp = _session.get("api.php", params={"what": "inventory", "for": "MallBot"}).json()
+            inventory = {int(k): int(v) for k, v in inv_resp.items()}
+        except _requests.exceptions.RequestException:
+            pass  # keep using last known values if the refresh fails
+        # Phase 1: fetch all listings in parallel — price ranges + snipe items together
+        rule_list   = [r for r in ranges.values() if not _job_cancel.is_set()]
+        snipe_list  = snipe_items or []
+
+        def _fetch_one(rule):
+            name = rule.get("name", f"item#{int(rule['item_id'])}")
+            return int(rule["item_id"]), _mall_mod._fetch_mall_listings(_session, name, exact=True)
+
+        # Build combined fetch list: range rules + snipe rules (tagged with _is_snipe)
+        all_fetch = list(rule_list) + [dict(si, _is_snipe=True) for si in snipe_list]
+
+        fetched = {}  # item_id -> (listings, error)
+        if max_workers > 1:
+            saved_delay = _session.delay
+            _session.delay = 0
+            try:
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_map = {executor.submit(_fetch_one, rule): rule for rule in all_fetch}
+                    for future in as_completed(future_map):
+                        try:
+                            item_id, listings = future.result()
+                            fetched[item_id] = (listings, None)
+                        except (_requests.exceptions.Timeout,
+                                _requests.exceptions.ConnectionError) as e:
+                            rule = future_map[future]
+                            fetched[int(rule["item_id"])] = (None, e)
+            finally:
+                _session.delay = saved_delay
+        else:
+            for rule in all_fetch:
+                if _job_cancel.is_set():
+                    break
+                try:
+                    item_id, listings = _fetch_one(rule)
+                    fetched[item_id] = (listings, None)
+                except (_requests.exceptions.Timeout,
+                        _requests.exceptions.ConnectionError) as e:
+                    fetched[int(rule["item_id"])] = (None, e)
+                    break
+
+        # Phase 2: evaluate all actions, collect buys sorted by estimated profit, sells last
+        pending_buys  = []  # list of (estimated_profit, action_fn) to execute in priority order
+        pending_sells = []  # list of action_fn to execute after all buys
+
+        # --- Evaluate price-range rules ---
+        for rule in rule_list:
+            if _job_cancel.is_set():
+                break
             item_id = int(rule["item_id"])
             name    = rule.get("name", f"item#{item_id}")
             min_p   = rule.get("min_price")
             max_p   = rule.get("max_price")
             buy_qty = rule.get("buy_qty", 1)
 
-            listings = _mall_mod._fetch_mall_listings(_session, name, exact=True)
+            listings, err = fetched.get(item_id, (None, None))
+            if err is not None:
+                if isinstance(err, _requests.exceptions.Timeout):
+                    _monitor_emit(f"  {name}: request timed out (server may be in rollover) — skipping this cycle")
+                else:
+                    _monitor_emit(f"  {name}: connection error ({err.__class__.__name__}) — skipping this cycle")
+                continue
             if not listings:
                 _monitor_emit(f"  {name}: no listings")
                 continue
 
-            # Exclude own store listings so our own price doesn't influence comparisons
             others = [l for l in listings if str(l["store_id"]) != own_store_id] if own_store_id else listings
             if not others:
                 _monitor_emit(f"  {name}: only own store listed, skipping")
                 continue
-            price = min(l["price"] for l in others)
 
-            if min_p and price < min_p:
-                _monitor_emit(f"  {name}: {price:,} < min {min_p:,} → buying {buy_qty}x")
-                buy_from_mall(_session, item_id, name, buy_qty, min_p)
-            elif max_p and price > max_p:
-                inv  = _session.get("api.php", params={"what": "inventory", "for": "MallBot"}).json()
-                have = int(inv.get(str(item_id), 0))
+            purchasable = [l for l in others
+                           if l["limit"] == 0 or
+                           purchase_tracker.get((l["store_id"], l["search_item_id"]), 0) < l["limit"]]
+            buy_price   = min(l["price"] for l in purchasable) if purchasable else None
+            unlimited   = [l for l in others if l["limit"] == 0]
+            unltd_price = min(l["price"] for l in unlimited) if unlimited else None
+
+            if min_p and buy_price is not None and buy_price <= min_p:
+                est_profit = (min_p - buy_price) * buy_qty
+                def _range_buy(item_id=item_id, name=name, buy_qty=buy_qty, min_p=min_p,
+                               buy_price=buy_price):
+                    _monitor_emit(f"  {name}: {buy_price:,} <= min {min_p:,} → buying {buy_qty}x")
+                    result = buy_from_mall(_session, item_id, name, buy_qty, min_p,
+                                          available_meat=meat,
+                                          purchase_tracker=purchase_tracker)
+                    return result["acquired"], result["spent"], item_id
+                pending_buys.append((est_profit, _range_buy))
+            elif max_p and unltd_price is not None and unltd_price >= max_p:
+                have = inventory.get(item_id, 0)
                 if have:
-                    undercut_price = int(price * (1 - undercut_pct / 100))
+                    undercut_price = int(unltd_price * (1 - undercut_pct / 100))
                     list_price     = max(max_p, undercut_price)
-                    _monitor_emit(f"  {name}: {price:,} > max {max_p:,} → listing {have}x at {list_price:,}")
-                    add_to_store(_session, item_id, have, list_price, name=name)
+                    def _range_sell(item_id=item_id, name=name, have=have,
+                                    list_price=list_price, unltd_price=unltd_price, max_p=max_p):
+                        _monitor_emit(f"  {name}: unltd {unltd_price:,} >= max {max_p:,} → listing {have}x at {list_price:,}")
+                        ok = add_to_store(_session, item_id, have, list_price, name=name)
+                        if ok:
+                            inventory[item_id] = inventory.get(item_id, 0) - have
+                    pending_sells.append(_range_sell)
                 else:
-                    _monitor_emit(f"  {name}: {price:,} > max {max_p:,}, none in inventory")
+                    _monitor_emit(f"  {name}: unltd {unltd_price:,} >= max {max_p:,}, none in inventory")
             else:
                 lo = f"{min_p:,}" if min_p else "—"
                 hi = f"{max_p:,}" if max_p else "—"
-                _monitor_emit(f"  {name}: {price:,} meat  (OK, range {lo}–{hi})")
+                unltd_disp = f"{unltd_price:,}" if unltd_price is not None else "no unltd listings"
+                buy_disp   = f"{buy_price:,}" if buy_price is not None else "none purchasable"
+                _monitor_emit(f"  {name}: {buy_disp} (unltd: {unltd_disp})  (OK, range {lo}–{hi})")
+
+        # --- Evaluate snipe items ---
+        snipe_actions = {}  # item_id -> action dict (deduplicate if same item in ranges+snipe)
+        for si in snipe_list:
+            if _job_cancel.is_set():
+                break
+            s_item_id = int(si["item_id"])
+            s_name    = si.get("name", f"item#{s_item_id}")
+            listings, err = fetched.get(s_item_id, (None, None))
+            if err is not None:
+                _monitor_emit(f"  [snipe] {s_name}: network error — skipping")
+                continue
+            if not listings:
+                _monitor_emit(f"  [snipe] {s_name}: no listings")
+                continue
+
+            try:
+                record = {
+                    str(s_item_id): {
+                        "ts": datetime.now().isoformat(timespec="seconds"),
+                        "mall_listings": [
+                            {"price": l["price"], "quantity": l["quantity"],
+                             "store_id": l["store_id"], "limit": l["limit"]}
+                            for l in listings[:10]
+                        ],
+                    }
+                }
+                with open(_PRICE_DATA_PATH, "a") as _f:
+                    _f.write(json.dumps(record) + "\n")
+            except Exception as _e:
+                _monitor_emit(f"  [price_data] write failed: {_e}")
+
+            action = evaluate_snipe(listings,
+                                    snipe_threshold=int(si.get("snipe_threshold", snipe_threshold)))
+            if action is None:
+                _monitor_emit(f"  [snipe] {s_name}: no opportunity")
+                continue
+
+            _monitor_emit(f"  [snipe] {s_name}: {action['reason']}")
+            relist = action["relist_at"]
+            buy_listings = action["buy"]
+            # Estimate profit: (relist - avg_buy_price) * total_qty
+            total_qty  = sum(l["quantity"] or 1 for l in buy_listings
+                             if not (own_store_id and str(l["store_id"]) == own_store_id))
+            avg_cost   = (sum(l["price"] * (l["quantity"] or 1) for l in buy_listings
+                              if not (own_store_id and str(l["store_id"]) == own_store_id))
+                          / total_qty) if total_qty > 0 else 0
+            est_profit = int((relist - avg_cost) * total_qty)
+
+            def _snipe_buy(s_item_id=s_item_id, s_name=s_name, buy_listings=buy_listings, relist=relist):
+                total_acquired = 0
+                total_spent    = 0
+                cur_meat       = meat  # snapshot; dispatch loop will update meat after
+                for listing in buy_listings:
+                    if own_store_id and str(listing["store_id"]) == own_store_id:
+                        own_qty = listing["quantity"] if listing["quantity"] > 0 else 1
+                        _monitor_emit(f"  [snipe] {s_name}: own listing at {listing['price']:,} → repricing {own_qty}x to {relist:,}")
+                        ok = remove_from_store(_session, s_item_id, own_qty)
+                        if ok:
+                            inventory[s_item_id] = inventory.get(s_item_id, 0) + own_qty
+                            add_to_store(_session, s_item_id, own_qty, relist, name=s_name)
+                            inventory[s_item_id] = inventory.get(s_item_id, 0) - own_qty
+                        continue
+                    if cur_meat <= 0:
+                        _monitor_emit(f"  [snipe] out of meat, stopping")
+                        break
+                    can_buy = listing["quantity"] if listing["quantity"] > 0 else 1
+                    can_buy = min(can_buy, cur_meat // listing["price"]) if listing["price"] > 0 else can_buy
+                    if can_buy <= 0:
+                        _monitor_emit(f"  [snipe] can't afford {listing['price']:,} — skipping store")
+                        continue
+                    result = buy_from_mall(_session, s_item_id, s_name, can_buy,
+                                           listing["price"],
+                                           available_meat=cur_meat,
+                                           purchase_tracker=purchase_tracker)
+                    acq, spent = result["acquired"], result["spent"]
+                    total_acquired += acq
+                    total_spent    += spent
+                    cur_meat       -= spent
+                    inventory[s_item_id] = inventory.get(s_item_id, 0) + acq
+                if total_acquired > 0:
+                    _monitor_emit(f"  [snipe] {s_name}: bought {total_acquired}x, relisting at {relist:,}")
+                    ok = add_to_store(_session, s_item_id, total_acquired, relist, name=s_name)
+                    if ok:
+                        inventory[s_item_id] = inventory.get(s_item_id, 0) - total_acquired
+                # inventory already updated inside; return spent so dispatch can update meat
+                return 0, total_spent, s_item_id
+
+            pending_buys.append((est_profit, _snipe_buy))
+
+        # Phase 3: execute buys highest-profit first, then sells
+        pending_buys.sort(key=lambda x: x[0], reverse=True)
+        for est_profit, action_fn in pending_buys:
+            if _job_cancel.is_set():
+                break
+            acquired, spent, item_id = action_fn()
+            meat -= spent
+            if acquired:  # only range buys return non-zero acquired (snipe handles inventory internally)
+                inventory[item_id] = inventory.get(item_id, 0) + acquired
+
+        for sell_fn in pending_sells:
+            if _job_cancel.is_set():
+                break
+            sell_fn()
+
         _monitor_emit(f"Sleeping {interval}s...")
         _job_cancel.wait(interval)
     _emit("Monitor stopped.")
@@ -263,7 +586,7 @@ def _do_view_store():
 def index():
     if not fs.get("logged_in"):
         return redirect(url_for("login"))
-    return Response(MAIN_HTML, mimetype="text/html")
+    return render_template("index.html")
 
 
 @app.route("/api/state")
@@ -272,10 +595,12 @@ def api_state():
         return jsonify({"error": "not logged in"}), 401
     cfg    = load_config()
     ranges = [v for k, v in cfg.get("price_ranges", {}).items() if k != "_comment"]
+    snipes = [v for k, v in cfg.get("snipe_items",  {}).items() if k != "_comment"]
     return jsonify({
         "username":   fs.get("username", ""),
         "cache_size": len(_cache._cache) if _cache else 0,
         "ranges":     ranges,
+        "snipes":     snipes,
     })
 
 
@@ -311,10 +636,10 @@ def api_mall_price():
     if not item_name:
         return jsonify({"error": "missing name"}), 400
     mall      = _mall_mod._fetch_mall_listings(_session, item_name, exact=True)
-    unlimited = sorted(l["price"] for l in mall if l["limit"] == 0)
+    unlimited = sorted((l["price"], l["quantity"]) for l in mall if l["limit"] == 0)
     limited   = sorted(l["price"] for l in mall if l["limit"] > 0)
     return jsonify({
-        "mall_unlimited": unlimited[:3],
+        "mall_unlimited": [{"price": p, "qty": q} for p, q in unlimited[:3]],
         "mall_limited":   limited[0] if limited else None,
     })
 
@@ -324,6 +649,33 @@ def api_store():
     if not fs.get("logged_in"):
         return jsonify({"error": "not logged in"}), 401
     return jsonify({"listings": _store_snapshot, "loaded": True})
+
+
+@app.route("/run/reprice", methods=["POST"])
+def run_reprice():
+    if not fs.get("logged_in"):
+        return jsonify({"error": "not logged in"}), 401
+    item_id   = request.form.get("item_id", "").strip()
+    new_price = request.form.get("new_price", "").strip()
+    limit     = request.form.get("limit", "0").strip()
+    name      = request.form.get("name", "").strip()
+    if not item_id or not new_price:
+        return jsonify({"error": "item_id and new_price are required"}), 400
+    try:
+        item_id   = int(item_id)
+        new_price = int(new_price)
+        limit     = int(limit) if limit else 0
+    except ValueError:
+        return jsonify({"error": "invalid values"}), 400
+    ok = reprice_in_store(_session, item_id, new_price, purchase_limit=limit, name=name)
+    # Update snapshot so the table reflects the change without a full refresh
+    for listing in _store_snapshot:
+        if listing.get("item_id") == item_id:
+            listing["price"] = new_price
+            break
+    if ok:
+        return jsonify({"ok": True, "message": f"Repriced to {new_price:,} meat."})
+    return jsonify({"error": "Reprice may have failed — check your store."}), 500
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -341,14 +693,16 @@ def login():
             _cache   = ItemCache(_session)
             fs["logged_in"] = True
             fs["username"]  = username
+            # _start_collector()  # price data collector disabled
             return redirect(url_for("index"))
         error = "Login failed — check your username and password."
-    return render_template_string(LOGIN_TMPL, error=error)
+    return render_template("login.html", error=error)
 
 
 @app.route("/logout", methods=["POST"])
 def logout():
     global _session, _cache
+    # _stop_collector()  # price data collector disabled
     if _session:
         _session.logout()
         _session = None
@@ -463,6 +817,55 @@ def run_action(action):
             return jsonify({"ok": True, "message": f"Removed range for \"{name}\"."})
         return jsonify({"error": "Range not found."}), 404
 
+    if action == "set_snipe":
+        id_or_name = request.form.get("item_id_or_name", "").strip()
+        threshold  = int(float(request.form.get("snipe_threshold", 700_000) or 700_000))
+        if not id_or_name:
+            return jsonify({"error": "Item ID or name is required."}), 400
+        cache_data = _cache._cache if _cache is not None else {}
+        if id_or_name.isdigit():
+            item_id = int(id_or_name)
+            name    = cache_data.get(item_id, {}).get("name", f"item#{item_id}")
+        else:
+            import re as _re
+            name_lower = id_or_name.lower()
+            name_norm  = _re.sub(r"[^\w\s]", "", name_lower)
+            item_id = next(
+                (iid for iid, info in cache_data.items()
+                 if info.get("name", "").lower() == name_lower
+                 or _re.sub(r"[^\w\s]", "", info.get("name", "").lower()) == name_norm),
+                None
+            )
+            if item_id is None:
+                if _session is None:
+                    return jsonify({"error": "Not logged in — cannot search mall by name."}), 400
+                listings = _mall_mod._fetch_mall_listings(_session, id_or_name)
+                if not listings:
+                    return jsonify({"error": f"Item \"{id_or_name}\" not found in the mall."}), 404
+                item_id = int(listings[0]["search_item_id"])
+                name    = listings[0].get("item_name") or id_or_name
+            else:
+                name = cache_data[item_id].get("name", id_or_name)
+        cfg = load_config()
+        cfg.setdefault("snipe_items", {})[str(item_id)] = {
+            "item_id":         item_id,
+            "name":            name,
+            "snipe_threshold": threshold,
+        }
+        save_config(cfg)
+        return jsonify({"ok": True, "message": f"Snipe item set: \"{name}\" (threshold {threshold:,})"})
+
+    if action == "rm_snipe":
+        item_id = request.form.get("item_id", "").strip()
+        cfg = load_config()
+        items = cfg.get("snipe_items", {})
+        if str(item_id) in items:
+            name = items[str(item_id)].get("name", f"item#{item_id}")
+            del items[str(item_id)]
+            save_config(cfg)
+            return jsonify({"ok": True, "message": f"Removed snipe item \"{name}\"."})
+        return jsonify({"error": "Snipe item not found."}), 404
+
     # Background job actions
     if _job_running:
         return jsonify({"error": "A job is already running. Please wait."}), 409
@@ -484,7 +887,9 @@ def run_action(action):
         _start_job(_do_monitor,
                    int(request.form.get("interval", 2) or 0),
                    float(request.form.get("undercut_pct", 0) or 0),
-                   request.form.get("verbose", "1") != "0")
+                   request.form.get("verbose", "1") != "0",
+                   max(1, int(request.form.get("max_workers", 5) or 5)),
+                   int(float(request.form.get("snipe_threshold", 700_000) or 700_000)))
     elif action == "view_store":
         _start_job(_do_view_store)
     else:
@@ -505,915 +910,6 @@ def get_lines():
     })
 
 
-# ---------------------------------------------------------------------------
-# HTML templates
-# ---------------------------------------------------------------------------
-
-LOGIN_TMPL = """<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>KoL Mall Bot — Login</title>
-  <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background: #0d1117; color: #c9d1d9; font-family: system-ui, sans-serif;
-           min-height: 100vh; display: flex; align-items: center; justify-content: center; }
-    .card { background: #161b22; border: 1px solid #30363d; border-radius: 10px;
-            padding: 2rem; width: 360px; }
-    h3 { color: #58a6ff; text-align: center; margin-bottom: 1.5rem; font-size: 1.3rem; }
-    label { display: block; font-size: .8rem; color: #8b949e; margin-bottom: .3rem; }
-    input { width: 100%; padding: .5rem .7rem; background: #0d1117; border: 1px solid #30363d;
-            border-radius: 5px; color: #c9d1d9; font-size: .9rem; outline: none; }
-    input:focus { border-color: #58a6ff; }
-    .field { margin-bottom: 1rem; }
-    button { width: 100%; padding: .6rem; background: #238636; border: none; border-radius: 5px;
-             color: #fff; font-size: .95rem; cursor: pointer; margin-top: .5rem; }
-    button:hover { background: #2ea043; }
-    .error { background: #3d1a1a; color: #f0a0a0; border: 1px solid #7a2020;
-             border-radius: 5px; padding: .6rem .8rem; font-size: .85rem; margin-bottom: 1rem; }
-  </style>
-</head>
-<body>
-<div class="card">
-  <h3>⚔️ KoL Mall Bot</h3>
-  {% if error %}<div class="error">{{ error }}</div>{% endif %}
-  <form method="POST" action="/login">
-    <div class="field"><label>Username</label><input type="text" name="username" autofocus></div>
-    <div class="field"><label>Password</label><input type="password" name="password"></div>
-    <button type="submit">Log In</button>
-  </form>
-</div>
-</body>
-</html>"""
-
-
-MAIN_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>KoL Mall Bot</title>
-  <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background: #0d1117; color: #c9d1d9; font-family: system-ui, sans-serif;
-           height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
-    .topbar { background: #161b22; border-bottom: 1px solid #30363d;
-              padding: .5rem 1rem; display: flex; align-items: center;
-              justify-content: space-between; flex-shrink: 0; }
-    .topbar-title { color: #58a6ff; font-weight: 600; font-size: 1rem; }
-    .topbar-right { display: flex; align-items: center; gap: 1rem; font-size: .8rem; color: #8b949e; }
-    .btn-logout { padding: .25rem .7rem; background: transparent; border: 1px solid #30363d;
-                  border-radius: 4px; color: #8b949e; cursor: pointer; font-size: .8rem; }
-    .btn-logout:hover { border-color: #8b949e; color: #c9d1d9; }
-    .body { display: flex; flex: 1; overflow: hidden; }
-    .sidebar { width: 185px; background: #161b22; border-right: 1px solid #30363d;
-               padding: .75rem .6rem; overflow-y: auto; flex-shrink: 0; }
-    .nav-section { font-size: .7rem; color: #484f58; text-transform: uppercase;
-                   letter-spacing: .06em; padding: .6rem .4rem .2rem; }
-    .nav-btn { display: block; width: 100%; text-align: left; background: transparent;
-               border: none; color: #8b949e; padding: .35rem .6rem; border-radius: 4px;
-               cursor: pointer; font-size: .82rem; margin-bottom: 1px; }
-    .nav-btn:hover { background: #21262d; color: #c9d1d9; }
-    .nav-btn.active { background: #21262d; color: #c9d1d9; }
-    .main { flex: 1; display: flex; flex-direction: column; overflow: hidden;
-            padding: .75rem; gap: .6rem; }
-    .form-panel { background: #161b22; border: 1px solid #30363d; border-radius: 6px;
-                  padding: .85rem 1rem; flex-shrink: 0; }
-    .form-panel h6 { color: #e6edf3; font-size: .875rem; margin-bottom: .75rem; }
-    .form-row { display: flex; flex-wrap: wrap; gap: .6rem; align-items: flex-end; }
-    .field { display: flex; flex-direction: column; gap: .25rem; }
-    .field label { font-size: .75rem; color: #8b949e; }
-    .field input { padding: .35rem .5rem; background: #0d1117; border: 1px solid #30363d;
-                   border-radius: 4px; color: #c9d1d9; font-size: .83rem;
-                   width: 110px; outline: none; }
-    .field input:focus { border-color: #58a6ff; }
-    .field input.narrow { width: 70px; }
-    .btn-run { padding: .35rem .9rem; background: #238636; border: none; border-radius: 4px;
-               color: #fff; font-size: .83rem; cursor: pointer; }
-    .btn-run:hover { background: #2ea043; }
-    .btn-stop { padding: .35rem .9rem; background: #7a1f1f; border: none; border-radius: 4px;
-                color: #fca5a5; font-size: .83rem; cursor: pointer; }
-    .btn-stop:hover { background: #991b1b; }
-    .btn-danger { padding: .35rem .9rem; background: #7a1f1f; border: none;
-                  border-radius: 4px; color: #fca5a5; font-size: .83rem; cursor: pointer; }
-    .btn-danger:hover { background: #991b1b; }
-    .hidden { display: none !important; }
-    /* Monitor + Ranges combined panel */
-    #panel-monitor { flex: 1; min-height: 0; padding: 0; border: none; background: transparent; }
-    #panel-monitor:not(.hidden) { display: flex; }
-    .monitor-layout { flex: 1; display: flex; gap: .6rem; min-height: 0; }
-    .monitor-left { flex: 1; display: flex; flex-direction: column; gap: .6rem; min-height: 0; }
-    .monitor-ranges-box { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
-    .ranges-table-wrap { flex: 1; overflow-y: auto; min-height: 0; margin-top: .6rem; }
-    .monitor-right { flex: 1; min-width: 200px; display: flex; flex-direction: column; min-height: 0; }
-    #monitor-output-box { flex: 1; overflow-y: auto; padding: .6rem .75rem; font-family: monospace;
-                          font-size: .78rem; line-height: 1.5; white-space: pre; color: #c9d1d9; }
-    /* List panel two-column layout */
-    #panel-list { flex: 1; min-height: 0; padding: 0; border: none; background: transparent; }
-    #panel-list:not(.hidden) { display: flex; }
-    .list-layout { flex: 1; display: flex; gap: .6rem; min-height: 0; }
-    .list-left { flex: 1; display: flex; flex-direction: column; min-height: 0;
-                 background: #161b22; border: 1px solid #30363d; border-radius: 6px; overflow: hidden; }
-    .list-controls { display: flex; align-items: flex-end; gap: .6rem; flex-shrink: 0;
-                     padding: .6rem 1rem; border-bottom: 1px solid #30363d; }
-    .list-table-wrap { flex: 1; overflow-y: auto; min-height: 0; }
-    .list-table { width: 100%; border-collapse: collapse; font-size: .8rem; }
-    .list-table thead th { position: sticky; top: 0; background: #1c2128; z-index: 1;
-                           color: #8b949e; font-weight: normal; padding: .3rem .5rem;
-                           border-bottom: 1px solid #30363d; white-space: nowrap; }
-    .list-table td { padding: .25rem .5rem; border-bottom: 1px solid #21262d; color: #c9d1d9; }
-    .list-refresh { flex-shrink: 0; border-top: 1px solid #30363d; padding: .5rem 1rem; }
-    .list-right { flex: 1; min-width: 200px; display: flex; flex-direction: column; min-height: 0; }
-    #panel-view_store { flex: 1; min-height: 0; display: flex; flex-direction: column; }
-    .store-table-wrap { flex: 1; overflow-y: auto; min-height: 0; margin-top: .6rem; }
-    #list-output-box { flex: 1; overflow-y: auto; padding: .6rem .75rem; font-family: monospace;
-                       font-size: .78rem; line-height: 1.5; white-space: pre; color: #c9d1d9; }
-    .msg { padding: .4rem .7rem; border-radius: 4px; font-size: .82rem; margin-bottom: .5rem; }
-    .msg-ok   { background: #0c2d1a; color: #4ade80; border: 1px solid #0c6b3a; }
-    .msg-err  { background: #2d0c0c; color: #f87171; border: 1px solid #6b1010; }
-    .msg-warn { background: #2d200c; color: #fbbf24; border: 1px solid #6b4a10; }
-    .rtable { width: 100%; font-size: .8rem; border-collapse: collapse; }
-    .rtable th { color: #8b949e; font-weight: normal; text-align: left;
-                 padding: .2rem .5rem; border-bottom: 1px solid #30363d; }
-    .rtable td { padding: .2rem .5rem; border-bottom: 1px solid #21262d; }
-    .rtable td.editable { cursor: pointer; }
-    .rtable td.editable:hover { background: #21262d; }
-    .rtable td.editable input { width: 80px; background: #0d1117; color: #c9d1d9;
-      border: 1px solid #388bfd; border-radius: 3px; padding: .1rem .3rem;
-      font-size: .8rem; outline: none; }
-    .output-wrap { flex: 1; display: flex; flex-direction: column; overflow: hidden;
-                   background: #0d1117; border: 1px solid #30363d; border-radius: 6px;
-                   min-height: 0; }
-    .output-bar { background: #161b22; border-bottom: 1px solid #30363d;
-                  padding: .35rem .75rem; display: flex; align-items: center;
-                  justify-content: space-between; flex-shrink: 0; }
-    .output-bar span { font-size: .78rem; color: #8b949e; }
-    .badge { font-size: .7rem; padding: .15em .5em; border-radius: 3px; }
-    .badge-idle    { background: #1f2937; color: #6b7280; }
-    .badge-running { background: #0c2d1a; color: #4ade80; }
-    .btn-clear { padding: .15rem .5rem; background: transparent; border: 1px solid #30363d;
-                 border-radius: 3px; color: #6b7280; font-size: .72rem; cursor: pointer; }
-    .btn-clear:hover { border-color: #8b949e; color: #c9d1d9; }
-    #output-box { flex: 1; overflow-y: auto; padding: .6rem .75rem; font-family: monospace;
-                  font-size: .78rem; line-height: 1.5; white-space: pre; color: #c9d1d9; }
-  </style>
-</head>
-<body>
-
-<div class="topbar">
-  <span class="topbar-title">KoL Mall Bot</span>
-  <div class="topbar-right">
-    <span id="user-info">loading...</span>
-    <form method="POST" action="/logout" style="margin:0">
-      <button type="submit" class="btn-logout">Logout</button>
-    </form>
-  </div>
-</div>
-
-<div class="body">
-  <nav class="sidebar">
-    <div class="nav-section">Inventory</div>
-    <button class="nav-btn" data-panel="list">List by Price</button>
-    <button class="nav-btn" data-panel="stock">Stock Mall</button>
-    <div class="nav-section">Monitor</div>
-    <button class="nav-btn" data-panel="monitor">Auto Monitor</button>
-    <div class="nav-section">Store</div>
-    <button class="nav-btn" data-panel="view_store">View My Store</button>
-  </nav>
-
-  <div class="main">
-
-    <div class="form-panel hidden" id="panel-list">
-      <div class="list-layout">
-        <div class="list-left">
-          <div class="list-controls">
-            <div class="field"><label>Display floor (meat)</label>
-              <input type="number" id="list-display-floor" value="0" min="0"></div>
-            <button id="btn-apply-floor" class="btn-run">Apply</button>
-            <span id="list-count" style="font-size:.78rem;color:#8b949e;align-self:center"></span>
-          </div>
-          <div class="list-table-wrap">
-            <table class="list-table">
-              <thead><tr>
-                <th style="text-align:left">ID</th>
-                <th style="text-align:left">Name</th>
-                <th style="text-align:right">Qty</th>
-                <th style="text-align:right">Min Price</th>
-                <th style="text-align:right">Unltd Price</th>
-                <th style="text-align:right">Total Value</th>
-              </tr></thead>
-              <tbody id="list-table-body">
-                <tr><td colspan="6" style="color:#8b949e;text-align:center;padding:.75rem">Loading...</td></tr>
-              </tbody>
-            </table>
-          </div>
-          <div class="list-refresh">
-            <div style="display:flex;align-items:flex-end;gap:2rem">
-              <div>
-                <button id="btn-reload-inv" class="btn-run" style="background:#1f6feb">Refresh Inventory</button>
-              </div>
-              <form id="form-list">
-                <div class="form-row">
-                  <div class="field"><label>Refresh threshold (meat)</label>
-                    <input type="number" name="refresh_threshold" value="2000" min="0"
-                      title="Skip a live mall lookup if the last recorded unlimited price is below this value."></div>
-                  <button type="submit" class="btn-run">Refresh Prices</button>
-                </div>
-              </form>
-            </div>
-          </div>
-        </div>
-        <div style="width:1px;background:#30363d;flex-shrink:0"></div>
-        <div class="list-right">
-          <div class="output-wrap" style="flex:1;min-height:0">
-            <div class="output-bar">
-              <span>Output</span>
-              <div style="display:flex;gap:.5rem;align-items:center">
-                <span id="list-status-badge" class="badge badge-idle">Idle</span>
-                <button id="list-btn-cancel" class="btn-stop hidden">Stop</button>
-                <button id="list-btn-clear" class="btn-clear">Clear</button>
-              </div>
-            </div>
-            <div id="list-output-box"></div>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <div class="form-panel hidden" id="panel-stock">
-      <h6>Stock Mall</h6>
-      <form id="form-stock">
-        <div class="form-row">
-          <div class="field"><label>Min mall price (meat)</label>
-            <input type="number" name="min_price" value="10000" min="0"></div>
-          <div class="field"><label>Markup %</label>
-            <input type="number" name="markup_pct" value="5" min="0" class="narrow"></div>
-          <div class="field"><label>Max qty / item</label>
-            <input type="number" name="max_qty" value="1" min="1" class="narrow"></div>
-          <button type="submit" class="btn-run">Run</button>
-        </div>
-      </form>
-    </div>
-
-    <div class="form-panel hidden" id="panel-monitor">
-      <div class="monitor-layout">
-        <div class="monitor-left">
-          <div class="form-panel" style="flex-shrink:0">
-            <h6>Auto Monitor</h6>
-            <form id="form-monitor">
-              <div class="form-row">
-                <div class="field"><label>Check interval (seconds)</label>
-                  <input type="number" name="interval" value="2" min="0"></div>
-                <div class="field"><label>Undercut %</label>
-                  <input type="number" name="undercut_pct" value="0" min="0" max="100" step="0.1" style="width:70px"></div>
-                <div class="field">
-                  <label>Verbose output</label>
-                  <select name="verbose" style="padding:.35rem .5rem;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#c9d1d9;font-size:.83rem;outline:none">
-                    <option value="1" selected>True</option>
-                    <option value="0">False</option>
-                  </select>
-                </div>
-                <button type="submit" id="monitor-btn-start" class="btn-run">Start</button>
-              </div>
-            </form>
-          </div>
-          <div class="form-panel monitor-ranges-box">
-            <h6>Price Ranges</h6>
-            <form id="form-add-range">
-              <div class="form-row">
-                <div class="field"><label>Item ID or Name</label>
-                  <input type="text" name="item_id_or_name" required style="width:160px" placeholder="e.g. 8823 or Mr. Burnsger"></div>
-                <div class="field"><label>Buy below (meat)</label>
-                  <input type="number" name="min_price" placeholder="optional"></div>
-                <div class="field"><label>Sell above (meat)</label>
-                  <input type="number" name="max_price" placeholder="optional"></div>
-                <div class="field"><label>Buy qty</label>
-                  <input type="number" name="buy_qty" value="1" min="1" class="narrow"></div>
-                <button type="submit" class="btn-run">Add / Update</button>
-              </div>
-            </form>
-            <div id="msg-ranges" style="margin-top:.5rem"></div>
-            <div class="ranges-table-wrap">
-              <div id="ranges-body"><p style="font-size:.82rem;color:#8b949e">Loading...</p></div>
-            </div>
-          </div>
-        </div>
-        <div style="width:1px;background:#30363d;flex-shrink:0"></div>
-        <div class="monitor-right">
-          <div class="output-wrap" style="flex:1;min-height:0">
-            <div class="output-bar">
-              <span>Output</span>
-              <div style="display:flex;gap:.5rem;align-items:center">
-                <span id="monitor-status-badge" class="badge badge-idle">Idle</span>
-                <button id="monitor-btn-clear" class="btn-clear">Clear</button>
-              </div>
-            </div>
-            <div id="monitor-output-box"></div>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <div class="form-panel hidden" id="panel-view_store">
-      <div style="display:flex;align-items:center;justify-content:space-between;flex-shrink:0">
-        <h6 style="margin:0">My Mall Store</h6>
-        <div style="display:flex;align-items:center;gap:.6rem">
-          <span id="store-status-badge" class="badge badge-idle">Idle</span>
-          <button id="btn-fetch-store" class="btn-run">Refresh</button>
-        </div>
-      </div>
-      <div class="store-table-wrap">
-        <table class="list-table">
-          <thead><tr>
-            <th style="text-align:left">ID</th>
-            <th style="text-align:left">Name</th>
-            <th style="text-align:right">Price</th>
-            <th style="text-align:right">Qty</th>
-            <th style="text-align:right">Limit</th>
-            <th style="text-align:right">Mall Unltd (low→high)</th>
-            <th style="text-align:right">Mall Ltd (lowest)</th>
-          </tr></thead>
-          <tbody id="store-table-body">
-            <tr><td colspan="7" style="color:#8b949e;text-align:center;padding:.75rem">Loading...</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
-
-    <div class="output-wrap" id="global-output-wrap">
-      <div class="output-bar">
-        <span>Output</span>
-        <div style="display:flex;gap:.5rem;align-items:center">
-          <span id="status-badge" class="badge badge-idle">Idle</span>
-          <button id="btn-cancel" class="btn-stop hidden">Stop</button>
-          <button id="btn-clear" class="btn-clear">Clear</button>
-        </div>
-      </div>
-      <div id="output-box"></div>
-    </div>
-
-  </div>
-</div>
-
-<script>
-// Navigation
-document.querySelectorAll('.nav-btn').forEach(function(btn) {
-  btn.addEventListener('click', function() {
-    var panel = btn.getAttribute('data-panel');
-    document.querySelectorAll('.main > .form-panel').forEach(function(el) { el.classList.add('hidden'); });
-    document.getElementById('panel-' + panel).classList.remove('hidden');
-    document.querySelectorAll('.nav-btn').forEach(function(b) { b.classList.remove('active'); });
-    btn.classList.add('active');
-    if (panel === 'list') {
-      document.getElementById('global-output-wrap').classList.add('hidden');
-      loadInventoryTable();
-    } else if (panel === 'view_store') {
-      document.getElementById('global-output-wrap').classList.add('hidden');
-      triggerStoreFetch();
-    } else if (panel === 'monitor') {
-      document.getElementById('global-output-wrap').classList.add('hidden');
-      loadRanges();
-    } else {
-      document.getElementById('global-output-wrap').classList.remove('hidden');
-    }
-  });
-});
-
-// Output polling
-var linesFrom = 0;
-var pollTimer = null;
-
-document.getElementById('btn-clear').addEventListener('click', function() {
-  document.getElementById('output-box').textContent = '';
-  linesFrom = 0;
-});
-
-function appendLines(lines) {
-  var box = document.getElementById('output-box');
-  var atBottom = box.scrollHeight - box.clientHeight <= box.scrollTop + 5;
-  box.textContent += lines.join('\\n') + (lines.length ? '\\n' : '');
-  if (atBottom) box.scrollTop = box.scrollHeight;
-}
-
-function setRunning(running) {
-  var badge = document.getElementById('status-badge');
-  badge.textContent = running ? 'Running...' : 'Idle';
-  badge.className = 'badge ' + (running ? 'badge-running' : 'badge-idle');
-  document.getElementById('btn-cancel').classList.toggle('hidden', !running);
-}
-
-function startPolling() {
-  if (pollTimer) return;
-  setRunning(true);
-  pollTimer = setInterval(poll, 500);
-}
-
-function stopPolling() {
-  clearInterval(pollTimer);
-  pollTimer = null;
-  setRunning(false);
-}
-
-function poll() {
-  fetch('/lines?from=' + linesFrom)
-    .then(function(r) { return r.json(); })
-    .then(function(data) {
-      if (data.lines && data.lines.length) {
-        appendLines(data.lines);
-        linesFrom = data.total;
-      }
-      if (!data.running) stopPolling();
-    })
-    .catch(function(e) { console.error('poll:', e); });
-}
-
-// Generic job form submit
-function bindJobForm(formId, action) {
-  var form = document.getElementById(formId);
-  if (!form) return;
-  form.addEventListener('submit', function(e) {
-    e.preventDefault();
-    document.getElementById('output-box').textContent = '';
-    linesFrom = 0;
-    var body = new URLSearchParams(new FormData(form));
-    fetch('/run/' + action, { method: 'POST', body: body })
-      .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
-      .then(function(res) {
-        if (!res.ok) { appendLines(['ERROR: ' + (res.data.error || 'unknown error')]); return; }
-        startPolling();
-      });
-  });
-}
-
-// Generic ajax form (instant, no polling)
-function bindAjaxForm(formId, action, msgId) {
-  var form = document.getElementById(formId);
-  if (!form) return;
-  form.addEventListener('submit', function(e) {
-    e.preventDefault();
-    var body = new URLSearchParams(new FormData(form));
-    fetch('/run/' + action, { method: 'POST', body: body })
-      .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
-      .then(function(res) {
-        var el = document.getElementById(msgId);
-        var cls = res.ok ? 'msg msg-ok' : 'msg msg-err';
-        el.innerHTML = '<div class="' + cls + '">' +
-          (res.data.message || res.data.error || (res.ok ? 'Done.' : 'Error')) + '</div>';
-      });
-  });
-}
-
-// ---- List panel ----
-var _inventoryItems = [];
-var listLinesFrom = 0;
-var listPollTimer = null;
-
-function loadInventoryTable() {
-  var tbody = document.getElementById('list-table-body');
-  fetch('/api/inventory')
-    .then(function(r) { return r.json(); })
-    .then(function(data) {
-      if (data.error) {
-        tbody.innerHTML = '<tr><td colspan="6" style="color:#f87171;text-align:center;padding:.75rem">' + data.error + '</td></tr>';
-        return;
-      }
-      if (!data.loaded) {
-        // No snapshot yet — auto-trigger a background fetch
-        tbody.innerHTML = '<tr><td colspan="6" style="color:#8b949e;text-align:center;padding:.75rem">Fetching inventory...</td></tr>';
-        triggerInventoryFetch();
-        return;
-      }
-      _inventoryItems = data.items;
-      applyListFilter();
-    })
-    .catch(function(e) {
-      tbody.innerHTML = '<tr><td colspan="6" style="color:#f87171;text-align:center;padding:.75rem">Error: ' + e + '</td></tr>';
-    });
-}
-
-function triggerInventoryFetch() {
-  var box = document.getElementById('list-output-box');
-  box.textContent = '';
-  listLinesFrom = 0;
-  fetch('/run/refresh_inventory', { method: 'POST', body: new URLSearchParams() })
-    .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
-    .then(function(res) {
-      if (!res.ok) return; // already running — polling will pick it up when done
-      startListPolling();
-    });
-}
-
-function applyListFilter() {
-  var floor = parseInt(document.getElementById('list-display-floor').value) || 0;
-  var filtered = _inventoryItems.filter(function(it) {
-    if (!it.has_cached || it.min_price === null) return floor === 0;
-    return it.min_price >= floor;
-  });
-  filtered.sort(function(a, b) {
-    var ap = a.min_price === null ? -1 : a.min_price;
-    var bp = b.min_price === null ? -1 : b.min_price;
-    return bp - ap;
-  });
-  var tbody = document.getElementById('list-table-body');
-  document.getElementById('list-count').textContent = filtered.length + ' item(s)';
-  if (filtered.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="6" style="color:#8b949e;text-align:center;padding:.75rem">No items match the current filter.</td></tr>';
-    return;
-  }
-  var rows = filtered.map(function(it) {
-    var minP  = it.min_price     === null ? '—' : it.min_price.toLocaleString();
-    var minU  = it.min_unlimited === null ? (it.has_cached ? '(none)' : '—') : it.min_unlimited.toLocaleString();
-    var total = it.min_price     === null ? '—' : (it.min_price * it.qty).toLocaleString();
-    return '<tr>' +
-      '<td>' + it.item_id + '</td>' +
-      '<td>' + it.name + '</td>' +
-      '<td style="text-align:right">' + it.qty.toLocaleString() + '</td>' +
-      '<td style="text-align:right">' + minP + '</td>' +
-      '<td style="text-align:right">' + minU + '</td>' +
-      '<td style="text-align:right">' + total + '</td>' +
-      '</tr>';
-  }).join('');
-  tbody.innerHTML = rows;
-}
-
-function setListRunning(running) {
-  var badge = document.getElementById('list-status-badge');
-  badge.textContent = running ? 'Running...' : 'Idle';
-  badge.className = 'badge ' + (running ? 'badge-running' : 'badge-idle');
-  document.getElementById('list-btn-cancel').classList.toggle('hidden', !running);
-}
-
-function startListPolling() {
-  if (listPollTimer) return;
-  setListRunning(true);
-  listPollTimer = setInterval(pollList, 500);
-}
-
-function stopListPolling() {
-  clearInterval(listPollTimer);
-  listPollTimer = null;
-  setListRunning(false);
-  loadInventoryTable();  // reload table with updated cache prices
-}
-
-function pollList() {
-  fetch('/lines?from=' + listLinesFrom)
-    .then(function(r) { return r.json(); })
-    .then(function(data) {
-      if (data.lines && data.lines.length) {
-        var box = document.getElementById('list-output-box');
-        var atBottom = box.scrollHeight - box.clientHeight <= box.scrollTop + 5;
-        box.textContent += data.lines.join('\\n') + '\\n';
-        if (atBottom) box.scrollTop = box.scrollHeight;
-        listLinesFrom = data.total;
-      }
-      if (!data.running) stopListPolling();
-    })
-    .catch(function(e) { console.error('pollList:', e); });
-}
-
-document.getElementById('form-list').addEventListener('submit', function(e) {
-  e.preventDefault();
-  var box = document.getElementById('list-output-box');
-  box.textContent = '';
-  listLinesFrom = 0;
-  var body = new URLSearchParams(new FormData(e.target));
-  fetch('/run/list', { method: 'POST', body: body })
-    .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
-    .then(function(res) {
-      if (!res.ok) { box.textContent += 'ERROR: ' + (res.data.error || 'unknown error') + '\\n'; return; }
-      startListPolling();
-    });
-});
-
-document.getElementById('list-btn-cancel').addEventListener('click', function() {
-  fetch('/run/cancel', { method: 'POST', body: new URLSearchParams() });
-});
-
-document.getElementById('list-btn-clear').addEventListener('click', function() {
-  document.getElementById('list-output-box').textContent = '';
-  listLinesFrom = 0;
-});
-
-document.getElementById('btn-apply-floor').addEventListener('click', applyListFilter);
-document.getElementById('list-display-floor').addEventListener('keydown', function(e) {
-  if (e.key === 'Enter') { e.preventDefault(); applyListFilter(); }
-});
-document.getElementById('btn-reload-inv').addEventListener('click', triggerInventoryFetch);
-bindJobForm('form-stock', 'stock');
-
-// ---- Monitor panel ----
-var monitorPollTimer = null;
-var monitorLinesFrom = 0;
-
-function appendMonitorLines(lines) {
-  var box = document.getElementById('monitor-output-box');
-  var atBottom = box.scrollHeight - box.clientHeight <= box.scrollTop + 5;
-  box.textContent += lines.join('\\n') + (lines.length ? '\\n' : '');
-  if (atBottom) box.scrollTop = box.scrollHeight;
-}
-
-function setMonitorRunning(running) {
-  var badge = document.getElementById('monitor-status-badge');
-  badge.textContent = running ? 'Running...' : 'Idle';
-  badge.className = 'badge ' + (running ? 'badge-running' : 'badge-idle');
-  var btn = document.getElementById('monitor-btn-start');
-  btn.textContent = running ? 'Stop' : 'Start';
-  btn.className = running ? 'btn-stop' : 'btn-run';
-}
-
-function startMonitorPolling() {
-  if (monitorPollTimer) return;
-  setMonitorRunning(true);
-  monitorPollTimer = setInterval(function() {
-    fetch('/lines?from=' + monitorLinesFrom)
-      .then(function(r) { return r.json(); })
-      .then(function(data) {
-        if (data.lines && data.lines.length) {
-          appendMonitorLines(data.lines);
-          monitorLinesFrom = data.total;
-        }
-        if (!data.running) { clearInterval(monitorPollTimer); monitorPollTimer = null; setMonitorRunning(false); }
-      })
-      .catch(function(e) { console.error('monitorPoll:', e); });
-  }, 500);
-}
-
-document.getElementById('form-monitor').addEventListener('submit', function(e) {
-  e.preventDefault();
-  if (monitorPollTimer) {
-    fetch('/run/cancel', { method: 'POST', body: new URLSearchParams() });
-    return;
-  }
-  document.getElementById('monitor-output-box').textContent = '';
-  monitorLinesFrom = 0;
-  var body = new URLSearchParams(new FormData(e.target));
-  fetch('/run/monitor', { method: 'POST', body: body })
-    .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
-    .then(function(res) {
-      if (!res.ok) { appendMonitorLines(['ERROR: ' + (res.data.error || 'unknown')]); return; }
-      startMonitorPolling();
-    });
-});
-
-document.getElementById('monitor-btn-clear').addEventListener('click', function() {
-  document.getElementById('monitor-output-box').textContent = '';
-  monitorLinesFrom = 0;
-});
-document.getElementById('form-add-range').addEventListener('submit', function(e) {
-  e.preventDefault();
-  var form = e.target;
-  var body = new URLSearchParams(new FormData(form));
-  fetch('/run/set_range', { method: 'POST', body: body })
-    .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
-    .then(function(res) {
-      var el = document.getElementById('msg-ranges');
-      if (res.data.choices) {
-        var html = '<div class="msg msg-warn">Multiple items matched — enter the item ID for the one you want:' +
-          '<ul style="margin:.35rem 0 0 1.1rem;line-height:1.8">';
-        res.data.choices.forEach(function(c) {
-          var safe = (c.name || '').replace(/&/g, '&amp;').replace(/</g, '&lt;');
-          html += '<li><b>' + c.item_id + '</b> \u2014 ' + safe + '</li>';
-        });
-        html += '</ul></div>';
-        el.innerHTML = html;
-        return;  // leave form intact
-      }
-      var cls = res.ok ? 'msg msg-ok' : 'msg msg-err';
-      el.innerHTML = '<div class="' + cls + '">' +
-        (res.data.message || res.data.error || (res.ok ? 'Done.' : 'Error')) + '</div>';
-      if (res.ok) { form.reset(); loadRanges(); }
-    });
-});
-
-// ---- Store panel ----
-var storePollTimer = null;
-
-function loadStoreTable() {
-  fetch('/api/store')
-    .then(function(r) { return r.json(); })
-    .then(function(data) {
-      var tbody = document.getElementById('store-table-body');
-      if (!data.listings || data.listings.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="7" style="color:#8b949e;text-align:center;padding:.75rem">Store is empty.</td></tr>';
-        return;
-      }
-      tbody.innerHTML = data.listings.map(function(it) {
-        var lim     = it.limit ? it.limit.toLocaleString() : '&mdash;';
-        var safeName = (it.name || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;');
-        return '<tr>' +
-          '<td>' + it.item_id + '</td>' +
-          '<td>' + it.name + '</td>' +
-          '<td style="text-align:right">' + it.price.toLocaleString() + '</td>' +
-          '<td style="text-align:right">' + it.quantity.toLocaleString() + '</td>' +
-          '<td style="text-align:right">' + lim + '</td>' +
-          '<td style="text-align:right">' +
-            '<button class="btn-fetch-mall" data-name="' + safeName + '" ' +
-            'style="font-size:.72rem;padding:.15rem .45rem">Check Prices</button>' +
-          '</td>' +
-          '<td style="text-align:right">&mdash;</td>' +
-          '</tr>';
-      }).join('');
-    });
-}
-
-function setStoreRunning(running) {
-  var badge = document.getElementById('store-status-badge');
-  badge.textContent = running ? 'Loading...' : 'Idle';
-  badge.className = 'badge ' + (running ? 'badge-running' : 'badge-idle');
-  document.getElementById('btn-fetch-store').disabled = running;
-}
-
-function stopStorePolling() {
-  clearInterval(storePollTimer);
-  storePollTimer = null;
-  setStoreRunning(false);
-  loadStoreTable();
-}
-
-function startStorePolling() {
-  if (storePollTimer) return;
-  setStoreRunning(true);
-  var from = 0;
-  storePollTimer = setInterval(function() {
-    fetch('/lines?from=' + from)
-      .then(function(r) { return r.json(); })
-      .then(function(data) {
-        from = data.total;
-        if (!data.running) stopStorePolling();
-      })
-      .catch(function(e) { console.error('storePoll:', e); });
-  }, 500);
-}
-
-function triggerStoreFetch() {
-  var tbody = document.getElementById('store-table-body');
-  tbody.innerHTML = '<tr><td colspan="7" style="color:#8b949e;text-align:center;padding:.75rem">Loading...</td></tr>';
-  fetch('/run/view_store', { method: 'POST', body: new URLSearchParams() })
-    .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
-    .then(function(res) {
-      if (!res.ok) {
-        document.getElementById('store-table-body').innerHTML =
-          '<tr><td colspan="7" style="color:#f87171;text-align:center;padding:.75rem">Error: ' +
-          (res.data.error || 'unknown') + '</td></tr>';
-        return;
-      }
-      startStorePolling();
-    });
-}
-
-document.getElementById('btn-fetch-store').addEventListener('click', triggerStoreFetch);
-
-document.addEventListener('click', function(e) {
-  if (!e.target.classList.contains('btn-fetch-mall')) return;
-  var btn  = e.target;
-  var name = btn.getAttribute('data-name');
-  var row  = btn.closest('tr');
-  btn.disabled    = true;
-  btn.textContent = '...';
-  fetch('/api/mall_price?name=' + encodeURIComponent(name))
-    .then(function(r) { return r.json(); })
-    .then(function(data) {
-      if (data.error) { btn.disabled = false; btn.textContent = 'Check Prices'; return; }
-      var cells = row.querySelectorAll('td');
-      var unltd = (data.mall_unlimited && data.mall_unlimited.length)
-        ? data.mall_unlimited.map(function(p) { return p.toLocaleString(); }).join(' \u00b7 ')
-        : '\u2014';
-      var ltd = data.mall_limited != null ? data.mall_limited.toLocaleString() : '\u2014';
-      cells[5].textContent = unltd;
-      cells[5].style.textAlign = 'right';
-      cells[6].textContent = ltd;
-      cells[6].style.textAlign = 'right';
-    })
-    .catch(function() { btn.disabled = false; btn.textContent = 'Check Prices'; });
-});
-
-document.getElementById('btn-cancel').addEventListener('click', function() {
-  fetch('/run/cancel', { method: 'POST', body: new URLSearchParams() });
-});
-
-// Load ranges table
-function loadRanges() {
-  fetch('/api/state')
-    .then(function(r) { return r.json(); })
-    .then(function(data) {
-      var el = document.getElementById('ranges-body');
-      if (!data.ranges || data.ranges.length === 0) {
-        el.innerHTML = '<p style="font-size:.82rem;color:#8b949e">No ranges configured yet.</p>';
-        return;
-      }
-      var rows = data.ranges.map(function(r) {
-        var minDisp = r.min_price != null ? r.min_price.toLocaleString() : '&mdash;';
-        var maxDisp = r.max_price != null ? r.max_price.toLocaleString() : '&mdash;';
-        var safeName = (r.name || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;');
-        var btnStyle = 'font-size:.72rem;padding:.15rem .45rem';
-        return '<tr>' +
-          '<td>' + r.item_id + '</td>' +
-          '<td>' + (r.name || '') + '</td>' +
-          '<td class="editable" data-field="min_price" data-value="' + (r.min_price != null ? r.min_price : '') + '">' + minDisp + '</td>' +
-          '<td class="editable" data-field="max_price" data-value="' + (r.max_price != null ? r.max_price : '') + '">' + maxDisp + '</td>' +
-          '<td class="editable" data-field="buy_qty"   data-value="' + (r.buy_qty || 1) + '">' + (r.buy_qty || 1) + '</td>' +
-          '<td style="white-space:nowrap">' +
-            '<button class="btn-run upd-range-btn" data-id="' + r.item_id + '" data-name="' + safeName + '" style="' + btnStyle + ';margin-right:.3rem">Update</button>' +
-            '<button class="btn-danger rm-range-btn" data-id="' + r.item_id + '" data-name="' + safeName + '" style="' + btnStyle + '">Remove</button>' +
-          '</td>' +
-          '</tr>';
-      }).join('');
-      el.innerHTML = '<table class="rtable"><thead><tr><th>ID</th><th>Name</th>' +
-        '<th>Buy Below</th><th>Sell Above</th><th>Buy Qty</th><th></th></tr></thead>' +
-        '<tbody>' + rows + '</tbody></table>';
-    });
-}
-
-document.addEventListener('click', function(e) {
-  if (!e.target.classList.contains('rm-range-btn')) return;
-  var itemId = e.target.getAttribute('data-id');
-  var name = e.target.getAttribute('data-name');
-  if (!confirm('Remove price range for "' + name + '"?')) return;
-  var body = new URLSearchParams();
-  body.append('item_id', itemId);
-  fetch('/run/remove_range', { method: 'POST', body: body })
-    .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
-    .then(function(res) {
-      var el = document.getElementById('msg-ranges');
-      var cls = res.ok ? 'msg msg-ok' : 'msg msg-err';
-      el.innerHTML = '<div class="' + cls + '">' +
-        (res.data.message || res.data.error || (res.ok ? 'Done.' : 'Error')) + '</div>';
-      if (res.ok) loadRanges();
-    });
-});
-
-// Click editable cell to switch to input
-document.addEventListener('click', function(e) {
-  var cell = e.target.closest('td.editable');
-  if (!cell || cell.querySelector('input')) return;
-  var val = cell.getAttribute('data-value');
-  var field = cell.getAttribute('data-field');
-  var min = field === 'buy_qty' ? '1' : '0';
-  var placeholder = (val === '' || val == null) ? 'optional' : '';
-  cell.innerHTML = '<input type="number" value="' + (val || '') +
-    '" placeholder="' + placeholder + '" min="' + min + '">';
-  var inp = cell.querySelector('input');
-  inp.focus();
-  inp.select();
-});
-
-// Update button — save edited fields for a row
-document.addEventListener('click', function(e) {
-  if (!e.target.classList.contains('upd-range-btn')) return;
-  var btn    = e.target;
-  var row    = btn.closest('tr');
-  var itemId = btn.getAttribute('data-id');
-  var name   = btn.getAttribute('data-name');
-
-  function cellVal(field) {
-    var cell = row.querySelector('td[data-field="' + field + '"]');
-    var inp  = cell && cell.querySelector('input');
-    return inp ? inp.value.trim() : (cell ? cell.getAttribute('data-value') : '');
-  }
-
-  var body = new URLSearchParams();
-  body.append('item_id_or_name', itemId);
-  var minVal = cellVal('min_price');
-  var maxVal = cellVal('max_price');
-  var qtyVal = cellVal('buy_qty');
-  if (minVal) body.append('min_price', minVal);
-  if (maxVal) body.append('max_price', maxVal);
-  body.append('buy_qty', qtyVal || '1');
-
-  btn.disabled = true;
-  fetch('/run/set_range', { method: 'POST', body: body })
-    .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
-    .then(function(res) {
-      btn.disabled = false;
-      var el = document.getElementById('msg-ranges');
-      var cls = res.ok ? 'msg msg-ok' : 'msg msg-err';
-      el.innerHTML = '<div class="' + cls + '">' +
-        (res.data.message || res.data.error || (res.ok ? 'Done.' : 'Error')) + '</div>';
-      if (res.ok) loadRanges();
-    });
-});
-
-// Init: load state and show first panel
-fetch('/api/state')
-  .then(function(r) { return r.json(); })
-  .then(function(data) {
-    document.getElementById('user-info').textContent =
-      data.username + '  \u00b7  ' + data.cache_size + ' items cached';
-  });
-
-document.querySelector('.nav-btn[data-panel="list"]').click();
-</script>
-</body>
-</html>"""
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    print("  KoL Mall Bot — Web UI")
-    print("  Open http://localhost:8080 in your browser.")
-    print("  Press Ctrl-C to stop the server.")
     app.run(host="127.0.0.1", port=8080, debug=False)
+

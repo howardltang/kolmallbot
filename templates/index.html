@@ -1,0 +1,957 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>KoL Mall Bot</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0d1117; color: #c9d1d9; font-family: system-ui, sans-serif;
+           height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+    .topbar { background: #161b22; border-bottom: 1px solid #30363d;
+              padding: .5rem 1rem; display: flex; align-items: center;
+              justify-content: space-between; flex-shrink: 0; }
+    .topbar-title { color: #58a6ff; font-weight: 600; font-size: 1rem; }
+    .topbar-right { display: flex; align-items: center; gap: 1rem; font-size: .8rem; color: #8b949e; }
+    .btn-logout { padding: .25rem .7rem; background: transparent; border: 1px solid #30363d;
+                  border-radius: 4px; color: #8b949e; cursor: pointer; font-size: .8rem; }
+    .btn-logout:hover { border-color: #8b949e; color: #c9d1d9; }
+    .body { display: flex; flex: 1; overflow: hidden; }
+    .sidebar { width: 185px; background: #161b22; border-right: 1px solid #30363d;
+               padding: .75rem .6rem; overflow-y: auto; flex-shrink: 0; }
+    .nav-section { font-size: .7rem; color: #484f58; text-transform: uppercase;
+                   letter-spacing: .06em; padding: .6rem .4rem .2rem; }
+    .nav-btn { display: block; width: 100%; text-align: left; background: transparent;
+               border: none; color: #8b949e; padding: .35rem .6rem; border-radius: 4px;
+               cursor: pointer; font-size: .82rem; margin-bottom: 1px; }
+    .nav-btn:hover { background: #21262d; color: #c9d1d9; }
+    .nav-btn.active { background: #21262d; color: #c9d1d9; }
+    .main { flex: 1; display: flex; flex-direction: column; overflow: hidden;
+            padding: .75rem; gap: .6rem; }
+    .form-panel { background: #161b22; border: 1px solid #30363d; border-radius: 6px;
+                  padding: .85rem 1rem; flex-shrink: 0; }
+    .form-panel h6 { color: #e6edf3; font-size: .875rem; margin-bottom: .75rem; }
+    .form-row { display: flex; flex-wrap: wrap; gap: .6rem; align-items: flex-end; }
+    .field { display: flex; flex-direction: column; gap: .25rem; }
+    .field label { font-size: .75rem; color: #8b949e; }
+    .field input { padding: .35rem .5rem; background: #0d1117; border: 1px solid #30363d;
+                   border-radius: 4px; color: #c9d1d9; font-size: .83rem;
+                   width: 110px; outline: none; }
+    .field input:focus { border-color: #58a6ff; }
+    .field input.narrow { width: 70px; }
+    .btn-run { padding: .35rem .9rem; background: #238636; border: none; border-radius: 4px;
+               color: #fff; font-size: .83rem; cursor: pointer; }
+    .btn-run:hover { background: #2ea043; }
+    .btn-stop { padding: .35rem .9rem; background: #7a1f1f; border: none; border-radius: 4px;
+                color: #fca5a5; font-size: .83rem; cursor: pointer; }
+    .btn-stop:hover { background: #991b1b; }
+    .btn-danger { padding: .35rem .9rem; background: #7a1f1f; border: none;
+                  border-radius: 4px; color: #fca5a5; font-size: .83rem; cursor: pointer; }
+    .btn-danger:hover { background: #991b1b; }
+    .hidden { display: none !important; }
+    /* Monitor + Ranges combined panel */
+    #panel-monitor { flex: 1; min-height: 0; padding: 0; border: none; background: transparent; }
+    #panel-monitor:not(.hidden) { display: flex; }
+    .monitor-layout { flex: 1; display: flex; gap: .6rem; min-height: 0; }
+    .monitor-left { flex: 1; display: flex; flex-direction: column; gap: .6rem; min-height: 0; }
+    .monitor-ranges-box { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+    .ranges-table-wrap { flex: 1; overflow-y: auto; min-height: 0; margin-top: .6rem; }
+    .monitor-right { flex: 1; min-width: 200px; display: flex; flex-direction: column; min-height: 0; }
+    #monitor-output-box { flex: 1; overflow-y: auto; padding: .6rem .75rem; font-family: monospace;
+                          font-size: .78rem; line-height: 1.5; white-space: pre; color: #c9d1d9; }
+    /* List panel two-column layout */
+    #panel-list { flex: 1; min-height: 0; padding: 0; border: none; background: transparent; }
+    #panel-list:not(.hidden) { display: flex; }
+    .list-layout { flex: 1; display: flex; gap: .6rem; min-height: 0; }
+    .list-left { flex: 1; display: flex; flex-direction: column; min-height: 0;
+                 background: #161b22; border: 1px solid #30363d; border-radius: 6px; overflow: hidden; }
+    .list-controls { display: flex; align-items: flex-end; gap: .6rem; flex-shrink: 0;
+                     padding: .6rem 1rem; border-bottom: 1px solid #30363d; }
+    .list-table-wrap { flex: 1; overflow-y: auto; min-height: 0; }
+    .list-table { width: 100%; border-collapse: collapse; font-size: .8rem; }
+    .list-table thead th { position: sticky; top: 0; background: #1c2128; z-index: 1;
+                           color: #8b949e; font-weight: normal; padding: .3rem .5rem;
+                           border-bottom: 1px solid #30363d; white-space: nowrap; }
+    .list-table td { padding: .25rem .5rem; border-bottom: 1px solid #21262d; color: #c9d1d9; }
+    .list-refresh { flex-shrink: 0; border-top: 1px solid #30363d; padding: .5rem 1rem; }
+    .list-right { flex: 1; min-width: 200px; display: flex; flex-direction: column; min-height: 0; }
+    #panel-view_store { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+    .store-table-wrap { flex: 1; overflow-y: auto; min-height: 0; margin-top: .6rem; }
+    #list-output-box { flex: 1; overflow-y: auto; padding: .6rem .75rem; font-family: monospace;
+                       font-size: .78rem; line-height: 1.5; white-space: pre; color: #c9d1d9; }
+    .msg { padding: .4rem .7rem; border-radius: 4px; font-size: .82rem; margin-bottom: .5rem; }
+    .msg-ok   { background: #0c2d1a; color: #4ade80; border: 1px solid #0c6b3a; }
+    .msg-err  { background: #2d0c0c; color: #f87171; border: 1px solid #6b1010; }
+    .msg-warn { background: #2d200c; color: #fbbf24; border: 1px solid #6b4a10; }
+    .rtable { width: 100%; font-size: .8rem; border-collapse: collapse; }
+    .rtable th { color: #8b949e; font-weight: normal; text-align: left;
+                 padding: .2rem .5rem; border-bottom: 1px solid #30363d; }
+    .rtable td { padding: .2rem .5rem; border-bottom: 1px solid #21262d; }
+    .rtable td.editable { cursor: pointer; }
+    .rtable td.editable:hover { background: #21262d; }
+    .rtable td.editable input { width: 80px; background: #0d1117; color: #c9d1d9;
+      border: 1px solid #388bfd; border-radius: 3px; padding: .1rem .3rem;
+      font-size: .8rem; outline: none; }
+    .output-wrap { flex: 1; display: flex; flex-direction: column; overflow: hidden;
+                   background: #0d1117; border: 1px solid #30363d; border-radius: 6px;
+                   min-height: 0; }
+    .output-bar { background: #161b22; border-bottom: 1px solid #30363d;
+                  padding: .35rem .75rem; display: flex; align-items: center;
+                  justify-content: space-between; flex-shrink: 0; }
+    .output-bar span { font-size: .78rem; color: #8b949e; }
+    .badge { font-size: .7rem; padding: .15em .5em; border-radius: 3px; }
+    .badge-idle    { background: #1f2937; color: #6b7280; }
+    .badge-running { background: #0c2d1a; color: #4ade80; }
+    .btn-clear { padding: .15rem .5rem; background: transparent; border: 1px solid #30363d;
+                 border-radius: 3px; color: #6b7280; font-size: .72rem; cursor: pointer; }
+    .btn-clear:hover { border-color: #8b949e; color: #c9d1d9; }
+    #output-box { flex: 1; overflow-y: auto; padding: .6rem .75rem; font-family: monospace;
+                  font-size: .78rem; line-height: 1.5; white-space: pre; color: #c9d1d9; }
+  </style>
+</head>
+<body>
+
+<div class="topbar">
+  <span class="topbar-title">KoL Mall Bot</span>
+  <div class="topbar-right">
+    <span id="user-info">loading...</span>
+    <form method="POST" action="/logout" style="margin:0">
+      <button type="submit" class="btn-logout">Logout</button>
+    </form>
+  </div>
+</div>
+
+<div class="body">
+  <nav class="sidebar">
+    <div class="nav-section">Inventory</div>
+    <button class="nav-btn" data-panel="list">List by Price</button>
+    <div class="nav-section">Monitor</div>
+    <button class="nav-btn" data-panel="monitor">Auto Monitor</button>
+    <div class="nav-section">Store</div>
+    <button class="nav-btn" data-panel="view_store">View My Store</button>
+  </nav>
+
+  <div class="main">
+
+    <div class="form-panel hidden" id="panel-list">
+      <div class="list-layout">
+        <div class="list-left">
+          <div class="list-controls">
+            <div class="field"><label>Display floor (meat)</label>
+              <input type="number" id="list-display-floor" value="0" min="0"></div>
+            <button id="btn-apply-floor" class="btn-run">Apply</button>
+            <span id="list-count" style="font-size:.78rem;color:#8b949e;align-self:center"></span>
+          </div>
+          <div class="list-table-wrap">
+            <table class="list-table">
+              <thead><tr>
+                <th style="text-align:left">ID</th>
+                <th style="text-align:left">Name</th>
+                <th style="text-align:right">Qty</th>
+                <th style="text-align:right">Min Price</th>
+                <th style="text-align:right">Unltd Price</th>
+                <th style="text-align:right">Total Value</th>
+              </tr></thead>
+              <tbody id="list-table-body">
+                <tr><td colspan="6" style="color:#8b949e;text-align:center;padding:.75rem">Loading...</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="list-refresh">
+            <div style="display:flex;align-items:flex-end;gap:2rem">
+              <div>
+                <button id="btn-reload-inv" class="btn-run" style="background:#1f6feb">Refresh Inventory</button>
+              </div>
+              <form id="form-list">
+                <div class="form-row">
+                  <div class="field"><label>Refresh threshold (meat)</label>
+                    <input type="number" name="refresh_threshold" value="2000" min="0"
+                      title="Skip a live mall lookup if the last recorded unlimited price is below this value."></div>
+                  <button type="submit" class="btn-run">Refresh Prices</button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </div>
+        <div style="width:1px;background:#30363d;flex-shrink:0"></div>
+        <div class="list-right">
+          <div class="output-wrap" style="flex:1;min-height:0">
+            <div class="output-bar">
+              <span>Output</span>
+              <div style="display:flex;gap:.5rem;align-items:center">
+                <span id="list-status-badge" class="badge badge-idle">Idle</span>
+                <button id="list-btn-cancel" class="btn-stop hidden">Stop</button>
+                <button id="list-btn-clear" class="btn-clear">Clear</button>
+              </div>
+            </div>
+            <div id="list-output-box"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+
+    <div class="form-panel hidden" id="panel-monitor">
+      <div class="monitor-layout">
+        <div class="monitor-left">
+          <div class="form-panel" style="flex-shrink:0">
+            <h6>Auto Monitor</h6>
+            <form id="form-monitor">
+              <div class="form-row">
+                <div class="field"><label>Check interval (seconds)</label>
+                  <input type="number" name="interval" value="60" min="0"></div>
+                <div class="field">
+                  <label>Parallel searches</label>
+                  <input type="number" name="max_workers" value="5" min="1"></div>
+                <div class="field">
+                  <label>Verbose output</label>
+                  <select name="verbose" style="padding:.35rem .5rem;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#c9d1d9;font-size:.83rem;outline:none">
+                    <option value="1">True</option>
+                    <option value="0" selected>False</option>
+                  </select>
+                </div>
+                <button type="submit" id="monitor-btn-start" class="btn-run">Start</button>
+              </div>
+            </form>
+          </div>
+          <div class="form-panel" style="flex-shrink:0">
+            <h6>Snipe Mode</h6>
+            <form id="form-add-snipe">
+              <div class="form-row">
+                <div class="field"><label>Item ID or Name</label>
+                  <input type="text" name="item_id_or_name" required style="width:160px" placeholder="e.g. 194 or Mr. Accessory"></div>
+                <div class="field"><label>Snipe threshold (meat)</label>
+                  <input type="number" name="snipe_threshold" value="700000" min="0" style="width:110px"></div>
+                <button type="submit" class="btn-run">Add / Update</button>
+              </div>
+            </form>
+            <div id="msg-snipe" style="margin-top:.5rem"></div>
+            <div id="snipe-body" style="font-size:.82rem;color:#8b949e;margin-top:.3rem">Loading...</div>
+          </div>
+          <div class="form-panel monitor-ranges-box">
+            <h6>Price Ranges</h6>
+            <form id="form-add-range">
+              <div class="form-row">
+                <div class="field"><label>Item ID or Name</label>
+                  <input type="text" name="item_id_or_name" required style="width:160px" placeholder="e.g. 8823 or Mr. Burnsger"></div>
+                <div class="field"><label>Buy below (meat)</label>
+                  <input type="number" name="min_price" placeholder="optional"></div>
+                <div class="field"><label>Sell above (meat)</label>
+                  <input type="number" name="max_price" placeholder="optional"></div>
+                <div class="field"><label>Buy qty</label>
+                  <input type="number" name="buy_qty" value="1" min="1" class="narrow"></div>
+                <button type="submit" class="btn-run">Add / Update</button>
+              </div>
+            </form>
+            <div id="msg-ranges" style="margin-top:.5rem"></div>
+            <div class="ranges-table-wrap">
+              <div id="ranges-body"><p style="font-size:.82rem;color:#8b949e">Loading...</p></div>
+            </div>
+          </div>
+        </div>
+        <div style="width:1px;background:#30363d;flex-shrink:0"></div>
+        <div class="monitor-right">
+          <div class="output-wrap" style="flex:1;min-height:0">
+            <div class="output-bar">
+              <span>Output</span>
+              <div style="display:flex;gap:.5rem;align-items:center">
+                <span id="monitor-status-badge" class="badge badge-idle">Idle</span>
+                <button id="monitor-btn-clear" class="btn-clear">Clear</button>
+              </div>
+            </div>
+            <div id="monitor-output-box"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="form-panel hidden" id="panel-view_store">
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-shrink:0">
+        <h6 style="margin:0">My Mall Store</h6>
+        <div style="display:flex;align-items:center;gap:.6rem">
+          <span id="store-status-badge" class="badge badge-idle">Idle</span>
+          <button id="btn-fetch-store" class="btn-run">Refresh</button>
+        </div>
+      </div>
+      <div class="store-table-wrap">
+        <table class="list-table">
+          <thead><tr>
+            <th style="text-align:left">ID</th>
+            <th style="text-align:left">Name</th>
+            <th style="text-align:right">Price</th>
+            <th style="text-align:right">Qty</th>
+            <th style="text-align:right">Limit</th>
+            <th style="text-align:right">Mall Unltd (low→high)</th>
+            <th style="text-align:right">Mall Ltd (lowest)</th>
+          </tr></thead>
+          <tbody id="store-table-body">
+            <tr><td colspan="7" style="color:#8b949e;text-align:center;padding:.75rem">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="output-wrap" id="global-output-wrap">
+      <div class="output-bar">
+        <span>Output</span>
+        <div style="display:flex;gap:.5rem;align-items:center">
+          <span id="status-badge" class="badge badge-idle">Idle</span>
+          <button id="btn-cancel" class="btn-stop hidden">Stop</button>
+          <button id="btn-clear" class="btn-clear">Clear</button>
+        </div>
+      </div>
+      <div id="output-box"></div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+// Navigation
+document.querySelectorAll('.nav-btn').forEach(function(btn) {
+  btn.addEventListener('click', function() {
+    var panel = btn.getAttribute('data-panel');
+    document.querySelectorAll('.main > .form-panel').forEach(function(el) { el.classList.add('hidden'); });
+    document.getElementById('panel-' + panel).classList.remove('hidden');
+    document.querySelectorAll('.nav-btn').forEach(function(b) { b.classList.remove('active'); });
+    btn.classList.add('active');
+    if (panel === 'list') {
+      document.getElementById('global-output-wrap').classList.add('hidden');
+      loadInventoryTable();
+    } else if (panel === 'view_store') {
+      document.getElementById('global-output-wrap').classList.add('hidden');
+      triggerStoreFetch();
+    } else if (panel === 'monitor') {
+      document.getElementById('global-output-wrap').classList.add('hidden');
+      loadRanges();
+      loadSnipes();
+    } else {
+      document.getElementById('global-output-wrap').classList.remove('hidden');
+    }
+  });
+});
+
+// Output polling
+var linesFrom = 0;
+var pollTimer = null;
+
+document.getElementById('btn-clear').addEventListener('click', function() {
+  document.getElementById('output-box').textContent = '';
+  linesFrom = 0;
+});
+
+function appendLines(lines) {
+  var box = document.getElementById('output-box');
+  var atBottom = box.scrollHeight - box.clientHeight <= box.scrollTop + 5;
+  box.textContent += lines.join('\n') + (lines.length ? '\n' : '');
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+function setRunning(running) {
+  var badge = document.getElementById('status-badge');
+  badge.textContent = running ? 'Running...' : 'Idle';
+  badge.className = 'badge ' + (running ? 'badge-running' : 'badge-idle');
+  document.getElementById('btn-cancel').classList.toggle('hidden', !running);
+}
+
+function startPolling() {
+  if (pollTimer) return;
+  setRunning(true);
+  pollTimer = setInterval(poll, 500);
+}
+
+function stopPolling() {
+  clearInterval(pollTimer);
+  pollTimer = null;
+  setRunning(false);
+}
+
+function poll() {
+  fetch('/lines?from=' + linesFrom)
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data.lines && data.lines.length) {
+        appendLines(data.lines);
+        linesFrom = data.total;
+      }
+      if (!data.running) stopPolling();
+    })
+    .catch(function(e) { console.error('poll:', e); });
+}
+
+// Generic job form submit
+function bindJobForm(formId, action) {
+  var form = document.getElementById(formId);
+  if (!form) return;
+  form.addEventListener('submit', function(e) {
+    e.preventDefault();
+    document.getElementById('output-box').textContent = '';
+    linesFrom = 0;
+    var body = new URLSearchParams(new FormData(form));
+    fetch('/run/' + action, { method: 'POST', body: body })
+      .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+      .then(function(res) {
+        if (!res.ok) { appendLines(['ERROR: ' + (res.data.error || 'unknown error')]); return; }
+        startPolling();
+      });
+  });
+}
+
+// Generic ajax form (instant, no polling)
+function bindAjaxForm(formId, action, msgId) {
+  var form = document.getElementById(formId);
+  if (!form) return;
+  form.addEventListener('submit', function(e) {
+    e.preventDefault();
+    var body = new URLSearchParams(new FormData(form));
+    fetch('/run/' + action, { method: 'POST', body: body })
+      .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+      .then(function(res) {
+        var el = document.getElementById(msgId);
+        var cls = res.ok ? 'msg msg-ok' : 'msg msg-err';
+        el.innerHTML = '<div class="' + cls + '">' +
+          (res.data.message || res.data.error || (res.ok ? 'Done.' : 'Error')) + '</div>';
+      });
+  });
+}
+
+// ---- List panel ----
+var _inventoryItems = [];
+var listLinesFrom = 0;
+var listPollTimer = null;
+
+function loadInventoryTable() {
+  var tbody = document.getElementById('list-table-body');
+  fetch('/api/inventory')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data.error) {
+        tbody.innerHTML = '<tr><td colspan="6" style="color:#f87171;text-align:center;padding:.75rem">' + data.error + '</td></tr>';
+        return;
+      }
+      if (!data.loaded) {
+        // No snapshot yet — auto-trigger a background fetch
+        tbody.innerHTML = '<tr><td colspan="6" style="color:#8b949e;text-align:center;padding:.75rem">Fetching inventory...</td></tr>';
+        triggerInventoryFetch();
+        return;
+      }
+      _inventoryItems = data.items;
+      applyListFilter();
+    })
+    .catch(function(e) {
+      tbody.innerHTML = '<tr><td colspan="6" style="color:#f87171;text-align:center;padding:.75rem">Error: ' + e + '</td></tr>';
+    });
+}
+
+function triggerInventoryFetch() {
+  var box = document.getElementById('list-output-box');
+  box.textContent = '';
+  listLinesFrom = 0;
+  fetch('/run/refresh_inventory', { method: 'POST', body: new URLSearchParams() })
+    .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+    .then(function(res) {
+      if (!res.ok) return; // already running — polling will pick it up when done
+      startListPolling();
+    });
+}
+
+function applyListFilter() {
+  var floor = parseInt(document.getElementById('list-display-floor').value) || 0;
+  var filtered = _inventoryItems.filter(function(it) {
+    if (!it.has_cached || it.min_price === null) return floor === 0;
+    return it.min_price >= floor;
+  });
+  filtered.sort(function(a, b) {
+    var ap = a.min_price === null ? -1 : a.min_price;
+    var bp = b.min_price === null ? -1 : b.min_price;
+    return bp - ap;
+  });
+  var tbody = document.getElementById('list-table-body');
+  document.getElementById('list-count').textContent = filtered.length + ' item(s)';
+  if (filtered.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" style="color:#8b949e;text-align:center;padding:.75rem">No items match the current filter.</td></tr>';
+    return;
+  }
+  var rows = filtered.map(function(it) {
+    var minP  = it.min_price     === null ? '—' : it.min_price.toLocaleString();
+    var minU  = it.min_unlimited === null ? (it.has_cached ? '(none)' : '—') : it.min_unlimited.toLocaleString();
+    var total = it.min_price     === null ? '—' : (it.min_price * it.qty).toLocaleString();
+    return '<tr>' +
+      '<td>' + it.item_id + '</td>' +
+      '<td>' + it.name + '</td>' +
+      '<td style="text-align:right">' + it.qty.toLocaleString() + '</td>' +
+      '<td style="text-align:right">' + minP + '</td>' +
+      '<td style="text-align:right">' + minU + '</td>' +
+      '<td style="text-align:right">' + total + '</td>' +
+      '</tr>';
+  }).join('');
+  tbody.innerHTML = rows;
+}
+
+function setListRunning(running) {
+  var badge = document.getElementById('list-status-badge');
+  badge.textContent = running ? 'Running...' : 'Idle';
+  badge.className = 'badge ' + (running ? 'badge-running' : 'badge-idle');
+  document.getElementById('list-btn-cancel').classList.toggle('hidden', !running);
+}
+
+function startListPolling() {
+  if (listPollTimer) return;
+  setListRunning(true);
+  listPollTimer = setInterval(pollList, 500);
+}
+
+function stopListPolling() {
+  clearInterval(listPollTimer);
+  listPollTimer = null;
+  setListRunning(false);
+  loadInventoryTable();  // reload table with updated cache prices
+}
+
+function pollList() {
+  fetch('/lines?from=' + listLinesFrom)
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data.lines && data.lines.length) {
+        var box = document.getElementById('list-output-box');
+        var atBottom = box.scrollHeight - box.clientHeight <= box.scrollTop + 5;
+        box.textContent += data.lines.join('\n') + '\n';
+        if (atBottom) box.scrollTop = box.scrollHeight;
+        listLinesFrom = data.total;
+      }
+      if (!data.running) stopListPolling();
+    })
+    .catch(function(e) { console.error('pollList:', e); });
+}
+
+document.getElementById('form-list').addEventListener('submit', function(e) {
+  e.preventDefault();
+  var box = document.getElementById('list-output-box');
+  box.textContent = '';
+  listLinesFrom = 0;
+  var body = new URLSearchParams(new FormData(e.target));
+  fetch('/run/list', { method: 'POST', body: body })
+    .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+    .then(function(res) {
+      if (!res.ok) { box.textContent += 'ERROR: ' + (res.data.error || 'unknown error') + '\n'; return; }
+      startListPolling();
+    });
+});
+
+document.getElementById('list-btn-cancel').addEventListener('click', function() {
+  fetch('/run/cancel', { method: 'POST', body: new URLSearchParams() });
+});
+
+document.getElementById('list-btn-clear').addEventListener('click', function() {
+  document.getElementById('list-output-box').textContent = '';
+  listLinesFrom = 0;
+});
+
+document.getElementById('btn-apply-floor').addEventListener('click', applyListFilter);
+document.getElementById('list-display-floor').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') { e.preventDefault(); applyListFilter(); }
+});
+document.getElementById('btn-reload-inv').addEventListener('click', triggerInventoryFetch);
+
+// ---- Monitor panel ----
+var monitorPollTimer = null;
+var monitorLinesFrom = 0;
+
+function appendMonitorLines(lines) {
+  var box = document.getElementById('monitor-output-box');
+  var atBottom = box.scrollHeight - box.clientHeight <= box.scrollTop + 5;
+  box.textContent += lines.join('\n') + (lines.length ? '\n' : '');
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+function setMonitorRunning(running) {
+  var badge = document.getElementById('monitor-status-badge');
+  badge.textContent = running ? 'Running...' : 'Idle';
+  badge.className = 'badge ' + (running ? 'badge-running' : 'badge-idle');
+  var btn = document.getElementById('monitor-btn-start');
+  btn.textContent = running ? 'Stop' : 'Start';
+  btn.className = running ? 'btn-stop' : 'btn-run';
+}
+
+function startMonitorPolling() {
+  if (monitorPollTimer) return;
+  setMonitorRunning(true);
+  monitorPollTimer = setInterval(function() {
+    fetch('/lines?from=' + monitorLinesFrom)
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (data.lines && data.lines.length) {
+          appendMonitorLines(data.lines);
+          monitorLinesFrom = data.total;
+        }
+        if (!data.running) { clearInterval(monitorPollTimer); monitorPollTimer = null; setMonitorRunning(false); }
+      })
+      .catch(function(e) { console.error('monitorPoll:', e); });
+  }, 500);
+}
+
+document.getElementById('form-monitor').addEventListener('submit', function(e) {
+  e.preventDefault();
+  if (monitorPollTimer) {
+    fetch('/run/cancel', { method: 'POST', body: new URLSearchParams() });
+    return;
+  }
+  document.getElementById('monitor-output-box').textContent = '';
+  monitorLinesFrom = 0;
+  var body = new URLSearchParams(new FormData(e.target));
+  fetch('/run/monitor', { method: 'POST', body: body })
+    .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+    .then(function(res) {
+      if (!res.ok) { appendMonitorLines(['ERROR: ' + (res.data.error || 'unknown')]); return; }
+      startMonitorPolling();
+    });
+});
+
+document.getElementById('monitor-btn-clear').addEventListener('click', function() {
+  document.getElementById('monitor-output-box').textContent = '';
+  monitorLinesFrom = 0;
+});
+document.getElementById('form-add-range').addEventListener('submit', function(e) {
+  e.preventDefault();
+  var form = e.target;
+  var body = new URLSearchParams(new FormData(form));
+  fetch('/run/set_range', { method: 'POST', body: body })
+    .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+    .then(function(res) {
+      var el = document.getElementById('msg-ranges');
+      if (res.data.choices) {
+        var html = '<div class="msg msg-warn">Multiple items matched — enter the item ID for the one you want:' +
+          '<ul style="margin:.35rem 0 0 1.1rem;line-height:1.8">';
+        res.data.choices.forEach(function(c) {
+          var safe = (c.name || '').replace(/&/g, '&amp;').replace(/</g, '&lt;');
+          html += '<li><b>' + c.item_id + '</b> — ' + safe + '</li>';
+        });
+        html += '</ul></div>';
+        el.innerHTML = html;
+        return;  // leave form intact
+      }
+      var cls = res.ok ? 'msg msg-ok' : 'msg msg-err';
+      el.innerHTML = '<div class="' + cls + '">' +
+        (res.data.message || res.data.error || (res.ok ? 'Done.' : 'Error')) + '</div>';
+      if (res.ok) { form.reset(); loadRanges(); }
+    });
+});
+
+// ---- Store panel ----
+var storePollTimer = null;
+
+function loadStoreTable() {
+  fetch('/api/store')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      var tbody = document.getElementById('store-table-body');
+      if (!data.listings || data.listings.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="7" style="color:#8b949e;text-align:center;padding:.75rem">Store is empty.</td></tr>';
+        return;
+      }
+      tbody.innerHTML = data.listings.map(function(it) {
+        var lim     = it.limit ? it.limit.toLocaleString() : '&mdash;';
+        var safeName = (it.name || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+        return '<tr data-item-id="' + it.item_id + '" data-limit="' + (it.limit || 0) + '" data-name="' + safeName + '">' +
+          '<td>' + it.item_id + '</td>' +
+          '<td>' + it.name + '</td>' +
+          '<td style="text-align:right">' +
+            '<input type="number" class="price-input" value="' + it.price + '" ' +
+            'style="width:110px;text-align:right;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#c9d1d9;font-size:.83rem;padding:.15rem .35rem">' +
+            ' <button class="btn-set-price" style="font-size:.72rem;padding:.15rem .45rem">Set</button>' +
+            '<span class="price-msg" style="font-size:.72rem;margin-left:.4rem"></span>' +
+          '</td>' +
+          '<td style="text-align:right">' + it.quantity.toLocaleString() + '</td>' +
+          '<td style="text-align:right">' + lim + '</td>' +
+          '<td style="text-align:right">' +
+            '<button class="btn-fetch-mall" data-name="' + safeName + '" ' +
+            'style="font-size:.72rem;padding:.15rem .45rem">Check Prices</button>' +
+          '</td>' +
+          '<td style="text-align:right">&mdash;</td>' +
+          '</tr>';
+      }).join('');
+    });
+}
+
+function setStoreRunning(running) {
+  var badge = document.getElementById('store-status-badge');
+  badge.textContent = running ? 'Loading...' : 'Idle';
+  badge.className = 'badge ' + (running ? 'badge-running' : 'badge-idle');
+  document.getElementById('btn-fetch-store').disabled = running;
+}
+
+function stopStorePolling() {
+  clearInterval(storePollTimer);
+  storePollTimer = null;
+  setStoreRunning(false);
+  loadStoreTable();
+}
+
+function startStorePolling() {
+  if (storePollTimer) return;
+  setStoreRunning(true);
+  var from = 0;
+  storePollTimer = setInterval(function() {
+    fetch('/lines?from=' + from)
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        from = data.total;
+        if (!data.running) stopStorePolling();
+      })
+      .catch(function(e) { console.error('storePoll:', e); });
+  }, 500);
+}
+
+function triggerStoreFetch() {
+  var tbody = document.getElementById('store-table-body');
+  tbody.innerHTML = '<tr><td colspan="7" style="color:#8b949e;text-align:center;padding:.75rem">Loading...</td></tr>';
+  fetch('/run/view_store', { method: 'POST', body: new URLSearchParams() })
+    .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+    .then(function(res) {
+      if (!res.ok) {
+        document.getElementById('store-table-body').innerHTML =
+          '<tr><td colspan="7" style="color:#f87171;text-align:center;padding:.75rem">Error: ' +
+          (res.data.error || 'unknown') + '</td></tr>';
+        return;
+      }
+      startStorePolling();
+    });
+}
+
+document.getElementById('btn-fetch-store').addEventListener('click', triggerStoreFetch);
+
+document.addEventListener('click', function(e) {
+  if (!e.target.classList.contains('btn-fetch-mall')) return;
+  var btn  = e.target;
+  var name = btn.getAttribute('data-name');
+  var row  = btn.closest('tr');
+  btn.disabled    = true;
+  btn.textContent = '...';
+  fetch('/api/mall_price?name=' + encodeURIComponent(name))
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data.error) { btn.disabled = false; btn.textContent = 'Check Prices'; return; }
+      var cells = row.querySelectorAll('td');
+      var unltd = (data.mall_unlimited && data.mall_unlimited.length)
+        ? data.mall_unlimited.map(function(e) {
+            return e.price.toLocaleString() + (e.qty > 0 ? ' x' + e.qty : '');
+          }).join(' · ')
+        : '—';
+      var ltd = data.mall_limited != null ? data.mall_limited.toLocaleString() : '—';
+      cells[5].textContent = unltd;
+      cells[5].style.textAlign = 'right';
+      cells[6].textContent = ltd;
+      cells[6].style.textAlign = 'right';
+    })
+    .catch(function() { btn.disabled = false; btn.textContent = 'Check Prices'; });
+});
+
+document.getElementById('btn-cancel').addEventListener('click', function() {
+  fetch('/run/cancel', { method: 'POST', body: new URLSearchParams() });
+});
+
+document.addEventListener('click', function(e) {
+  if (!e.target.classList.contains('btn-set-price')) return;
+  var btn  = e.target;
+  var row  = btn.closest('tr');
+  var msg  = row.querySelector('.price-msg');
+  var inp  = row.querySelector('.price-input');
+  var newPrice = parseInt(inp.value, 10);
+  if (isNaN(newPrice) || newPrice <= 0) { msg.textContent = 'Invalid price'; msg.style.color='#f87171'; return; }
+  var itemId = row.getAttribute('data-item-id');
+  var limit  = row.getAttribute('data-limit');
+  var name   = row.getAttribute('data-name');
+  btn.disabled = true;
+  msg.textContent = '...';
+  msg.style.color = '#8b949e';
+  var body = new URLSearchParams();
+  body.append('item_id',   itemId);
+  body.append('new_price', newPrice);
+  body.append('limit',     limit);
+  body.append('name',      name);
+  fetch('/run/reprice', { method: 'POST', body: body })
+    .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+    .then(function(res) {
+      btn.disabled = false;
+      if (res.ok) {
+        msg.textContent = '✓';
+        msg.style.color = '#3fb950';
+        setTimeout(function() { msg.textContent = ''; }, 3000);
+      } else {
+        msg.textContent = res.data.error || 'Failed';
+        msg.style.color = '#f87171';
+      }
+    })
+    .catch(function() { btn.disabled = false; msg.textContent = 'Error'; msg.style.color = '#f87171'; });
+});
+
+// Snipe items table
+function loadSnipes() {
+  fetch('/api/state')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      var el = document.getElementById('snipe-body');
+      if (!data.snipes || data.snipes.length === 0) {
+        el.innerHTML = '<p style="font-size:.82rem;color:#8b949e">No snipe items configured yet.</p>';
+        return;
+      }
+      var btnStyle = 'font-size:.72rem;padding:.15rem .45rem';
+      var rows = data.snipes.map(function(s) {
+        var safeName = (s.name || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+        return '<tr>' +
+          '<td>' + s.item_id + '</td>' +
+          '<td>' + (s.name || '') + '</td>' +
+          '<td>' + (s.snipe_threshold || 700000).toLocaleString() + '</td>' +
+          '<td><button class="btn-danger rm-snipe-btn" data-id="' + s.item_id + '" data-name="' + safeName + '" style="' + btnStyle + '">Remove</button></td>' +
+          '</tr>';
+      }).join('');
+      el.innerHTML = '<table class="rtable"><thead><tr><th>ID</th><th>Name</th><th>Threshold</th><th></th></tr></thead>' +
+        '<tbody>' + rows + '</tbody></table>';
+    });
+}
+
+document.getElementById('form-add-snipe').addEventListener('submit', function(e) {
+  e.preventDefault();
+  var body = new URLSearchParams(new FormData(this));
+  fetch('/run/set_snipe', { method: 'POST', body: body })
+    .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+    .then(function(res) {
+      var el = document.getElementById('msg-snipe');
+      var cls = res.ok ? 'msg msg-ok' : 'msg msg-err';
+      el.innerHTML = '<div class="' + cls + '">' +
+        (res.data.message || res.data.error || (res.ok ? 'Done.' : 'Error')) + '</div>';
+      if (res.ok) { document.getElementById('form-add-snipe').reset(); loadSnipes(); }
+    });
+});
+
+document.addEventListener('click', function(e) {
+  if (!e.target.classList.contains('rm-snipe-btn')) return;
+  var itemId = e.target.getAttribute('data-id');
+  var name   = e.target.getAttribute('data-name');
+  if (!confirm('Remove snipe item "' + name + '"?')) return;
+  var body = new URLSearchParams();
+  body.append('item_id', itemId);
+  fetch('/run/rm_snipe', { method: 'POST', body: body })
+    .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+    .then(function(res) {
+      var el = document.getElementById('msg-snipe');
+      el.innerHTML = '<div class="' + (res.ok ? 'msg msg-ok' : 'msg msg-err') + '">' +
+        (res.data.message || res.data.error || (res.ok ? 'Done.' : 'Error')) + '</div>';
+      if (res.ok) loadSnipes();
+    });
+});
+
+// Load ranges table
+function loadRanges() {
+  fetch('/api/state')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      var el = document.getElementById('ranges-body');
+      if (!data.ranges || data.ranges.length === 0) {
+        el.innerHTML = '<p style="font-size:.82rem;color:#8b949e">No ranges configured yet.</p>';
+        return;
+      }
+      var rows = data.ranges.map(function(r) {
+        var minDisp = r.min_price != null ? r.min_price.toLocaleString() : '&mdash;';
+        var maxDisp = r.max_price != null ? r.max_price.toLocaleString() : '&mdash;';
+        var safeName = (r.name || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+        var btnStyle = 'font-size:.72rem;padding:.15rem .45rem';
+        return '<tr>' +
+          '<td>' + r.item_id + '</td>' +
+          '<td>' + (r.name || '') + '</td>' +
+          '<td class="editable" data-field="min_price" data-value="' + (r.min_price != null ? r.min_price : '') + '">' + minDisp + '</td>' +
+          '<td class="editable" data-field="max_price" data-value="' + (r.max_price != null ? r.max_price : '') + '">' + maxDisp + '</td>' +
+          '<td class="editable" data-field="buy_qty"   data-value="' + (r.buy_qty || 1) + '">' + (r.buy_qty || 1) + '</td>' +
+          '<td style="white-space:nowrap">' +
+            '<button class="btn-run upd-range-btn" data-id="' + r.item_id + '" data-name="' + safeName + '" style="' + btnStyle + ';margin-right:.3rem">Update</button>' +
+            '<button class="btn-danger rm-range-btn" data-id="' + r.item_id + '" data-name="' + safeName + '" style="' + btnStyle + '">Remove</button>' +
+          '</td>' +
+          '</tr>';
+      }).join('');
+      el.innerHTML = '<table class="rtable"><thead><tr><th>ID</th><th>Name</th>' +
+        '<th>Buy Below</th><th>Sell Above</th><th>Buy Qty</th><th></th></tr></thead>' +
+        '<tbody>' + rows + '</tbody></table>';
+    });
+}
+
+document.addEventListener('click', function(e) {
+  if (!e.target.classList.contains('rm-range-btn')) return;
+  var itemId = e.target.getAttribute('data-id');
+  var name = e.target.getAttribute('data-name');
+  if (!confirm('Remove price range for "' + name + '"?')) return;
+  var body = new URLSearchParams();
+  body.append('item_id', itemId);
+  fetch('/run/remove_range', { method: 'POST', body: body })
+    .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+    .then(function(res) {
+      var el = document.getElementById('msg-ranges');
+      var cls = res.ok ? 'msg msg-ok' : 'msg msg-err';
+      el.innerHTML = '<div class="' + cls + '">' +
+        (res.data.message || res.data.error || (res.ok ? 'Done.' : 'Error')) + '</div>';
+      if (res.ok) loadRanges();
+    });
+});
+
+// Click editable cell to switch to input
+document.addEventListener('click', function(e) {
+  var cell = e.target.closest('td.editable');
+  if (!cell || cell.querySelector('input')) return;
+  var val = cell.getAttribute('data-value');
+  var field = cell.getAttribute('data-field');
+  var min = field === 'buy_qty' ? '1' : '0';
+  var placeholder = (val === '' || val == null) ? 'optional' : '';
+  cell.innerHTML = '<input type="number" value="' + (val || '') +
+    '" placeholder="' + placeholder + '" min="' + min + '">';
+  var inp = cell.querySelector('input');
+  inp.focus();
+  inp.select();
+});
+
+// Update button — save edited fields for a row
+document.addEventListener('click', function(e) {
+  if (!e.target.classList.contains('upd-range-btn')) return;
+  var btn    = e.target;
+  var row    = btn.closest('tr');
+  var itemId = btn.getAttribute('data-id');
+  var name   = btn.getAttribute('data-name');
+
+  function cellVal(field) {
+    var cell = row.querySelector('td[data-field="' + field + '"]');
+    var inp  = cell && cell.querySelector('input');
+    return inp ? inp.value.trim() : (cell ? cell.getAttribute('data-value') : '');
+  }
+
+  var body = new URLSearchParams();
+  body.append('item_id_or_name', itemId);
+  var minVal = cellVal('min_price');
+  var maxVal = cellVal('max_price');
+  var qtyVal = cellVal('buy_qty');
+  if (minVal) body.append('min_price', minVal);
+  if (maxVal) body.append('max_price', maxVal);
+  body.append('buy_qty', qtyVal || '1');
+
+  btn.disabled = true;
+  fetch('/run/set_range', { method: 'POST', body: body })
+    .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+    .then(function(res) {
+      btn.disabled = false;
+      var el = document.getElementById('msg-ranges');
+      var cls = res.ok ? 'msg msg-ok' : 'msg msg-err';
+      el.innerHTML = '<div class="' + cls + '">' +
+        (res.data.message || res.data.error || (res.ok ? 'Done.' : 'Error')) + '</div>';
+      if (res.ok) loadRanges();
+    });
+});
+
+// Init: load state and show first panel
+fetch('/api/state')
+  .then(function(r) { return r.json(); })
+  .then(function(data) {
+    document.getElementById('user-info').textContent =
+      data.username + '  ·  ' + data.cache_size + ' items cached';
+  });
+
+document.querySelector('.nav-btn[data-panel="list"]').click();
+</script>
+</body>
+</html>
