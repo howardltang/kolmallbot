@@ -529,6 +529,7 @@ def _parse_acquired(html: str) -> int:
 
 def evaluate_snipe(listings: List[Dict],
                    snipe_threshold: int = 700_000,
+                   undercut: int = 1000,
                    max_vol_a: int = 5,
                    max_combined_vol_c: int = 4,
                    max_stores_c: int = 4) -> Optional[Dict]:
@@ -566,7 +567,7 @@ def evaluate_snipe(listings: List[Dict],
     p1_m = others[0]["price"]
     p2_m = others[1]["price"]
     if p1_m > 0 and p1_m <= p2_m * 0.5:
-        relist = p2_m - 1000
+        relist = p2_m - undercut
         return {
             "scenario":  "M",
             "buy":       [others[0]],
@@ -585,7 +586,7 @@ def evaluate_snipe(listings: List[Dict],
         all_below    = all(next_l["price"] - l["price"] >= snipe_threshold for l in group)
         vol_ok       = combined_vol <= (max_vol_a if n == 1 else max_combined_vol_c)
         if all_below and vol_ok:
-            relist = next_l["price"] - 1000
+            relist = next_l["price"] - undercut
             prices = [f"{l['price']:,}(x{l['quantity']})" for l in group]
             return {
                 "scenario":  "A",
@@ -603,7 +604,7 @@ def evaluate_snipe(listings: List[Dict],
         p3     = others[2]["price"]
         if (q1 <= 2 and (p2 - p1) >= int(snipe_threshold * 0.7) and q2 <= 3
                 and (p3 - p1) >= snipe_threshold):
-            relist = p2 - 1000
+            relist = p2 - undercut
             return {
                 "scenario":  "B",
                 "buy":       [others[0]],

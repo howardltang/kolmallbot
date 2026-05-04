@@ -275,25 +275,24 @@ def _do_stock(min_price: int, markup_pct: int, max_qty: int):
     _emit(f"Done. Stocked {stocked}, skipped {skipped}.")
 
 
-def _do_monitor(interval: int, undercut_pct: float = 0, verbose: bool = True,
+def _do_monitor(interval: int, verbose: bool = True,
                 max_workers: int = 5, snipe_threshold: int = 700_000):
     global _monitor_verbose
     _monitor_verbose = verbose
     _mall_mod._status = _monitor_emit  # type: ignore
-    # Build snipe item list from config
     cfg = load_config()
     snipe_cfg   = cfg.get("snipe_items", {})
     snipe_items = [v for k, v in snipe_cfg.items()
                    if k != "_comment" and str(k).lstrip("-").isdigit()] if snipe_cfg else None
     try:
-        _do_monitor_inner(interval, undercut_pct, max_workers,
+        _do_monitor_inner(interval, max_workers,
                           snipe_items=snipe_items, snipe_threshold=snipe_threshold)
     finally:
         _mall_mod._status = _emit  # type: ignore
         _monitor_verbose = True
 
 
-def _do_monitor_inner(interval: int, undercut_pct: float = 0, max_workers: int = 5,
+def _do_monitor_inner(interval: int, max_workers: int = 5,
                       snipe_items: Optional[List[Dict]] = None,
                       snipe_threshold: int = 700_000):
     cfg    = load_config()
@@ -303,7 +302,6 @@ def _do_monitor_inner(interval: int, undercut_pct: float = 0, max_workers: int =
         _emit("No price ranges configured.")
         return
     own_store_id = str(_session.player_id) if _session.player_id else None
-    undercut_label = f" (undercut {undercut_pct:g}%)" if undercut_pct else ""
 
     # Fetch inventory and meat balance once; keep them updated after each transaction.
     _emit("Fetching initial inventory and meat balance...")
@@ -328,7 +326,7 @@ def _do_monitor_inner(interval: int, undercut_pct: float = 0, max_workers: int =
     purchase_tracker: Dict = {}
     tracker_date = _kol_day()
 
-    _emit(f"Monitoring {len(ranges)} item(s) every {interval}s{undercut_label}. Click Stop to end.")
+    _emit(f"Monitoring {len(ranges)} item(s) every {interval}s. Click Stop to end.")
     while not _job_cancel.is_set():
         # Reset purchase tracker after KoL rollover (8:32 PST)
         today = _kol_day()
@@ -438,8 +436,8 @@ def _do_monitor_inner(interval: int, undercut_pct: float = 0, max_workers: int =
             elif max_p and unltd_price is not None and unltd_price >= max_p:
                 have = inventory.get(item_id, 0)
                 if have:
-                    undercut_price = int(unltd_price * (1 - undercut_pct / 100))
-                    list_price     = max(max_p, undercut_price)
+                    range_undercut = int(rule.get("undercut", 0))
+                    list_price     = max(max_p, unltd_price - range_undercut)
                     def _range_sell(item_id=item_id, name=name, have=have,
                                     list_price=list_price, unltd_price=unltd_price, max_p=max_p):
                         _monitor_emit(f"  {name}: unltd {unltd_price:,} >= max {max_p:,} → listing {have}x at {list_price:,}")
@@ -488,7 +486,8 @@ def _do_monitor_inner(interval: int, undercut_pct: float = 0, max_workers: int =
                 _monitor_emit(f"  [price_data] write failed: {_e}")
 
             action = evaluate_snipe(listings,
-                                    snipe_threshold=int(si.get("snipe_threshold", snipe_threshold)))
+                                    snipe_threshold=int(si.get("snipe_threshold", snipe_threshold)),
+                                    undercut=int(si.get("undercut", 1000)))
             if action is None:
                 _monitor_emit(f"  [snipe] {s_name}: no opportunity")
                 continue
@@ -775,7 +774,8 @@ def run_action(action):
                 _cache._dirty = True
         min_p   = request.form.get("min_price", "").strip() or None
         max_p   = request.form.get("max_price", "").strip() or None
-        buy_qty = int(request.form.get("buy_qty", 1) or 1)
+        buy_qty    = int(request.form.get("buy_qty", 1) or 1)
+        r_undercut = int(request.form.get("undercut", 0) or 0)
         cached_name = _cache._cache.get(item_id, {}).get("name", "")
         if cached_name and not cached_name.startswith("item#"):
             info = _cache._cache[item_id]  # name already known, skip API
@@ -797,6 +797,7 @@ def run_action(action):
             "min_price": int(min_p) if min_p else None,
             "max_price": int(max_p) if max_p else None,
             "buy_qty":   buy_qty,
+            "undercut":  r_undercut,
         }
         save_config(cfg)
         return jsonify({"ok": True, "message": f"Saved range for \"{info['name']}\"."})
@@ -820,6 +821,7 @@ def run_action(action):
     if action == "set_snipe":
         id_or_name = request.form.get("item_id_or_name", "").strip()
         threshold  = int(float(request.form.get("snipe_threshold", 700_000) or 700_000))
+        s_undercut = int(float(request.form.get("undercut", 1000) or 1000))
         if not id_or_name:
             return jsonify({"error": "Item ID or name is required."}), 400
         cache_data = _cache._cache if _cache is not None else {}
@@ -851,9 +853,10 @@ def run_action(action):
             "item_id":         item_id,
             "name":            name,
             "snipe_threshold": threshold,
+            "undercut":        s_undercut,
         }
         save_config(cfg)
-        return jsonify({"ok": True, "message": f"Snipe item set: \"{name}\" (threshold {threshold:,})"})
+        return jsonify({"ok": True, "message": f"Snipe item set: \"{name}\" (threshold {threshold:,}, undercut {s_undercut:,})"})
 
     if action == "rm_snipe":
         item_id = request.form.get("item_id", "").strip()
@@ -885,8 +888,7 @@ def run_action(action):
         )
     elif action == "monitor":
         _start_job(_do_monitor,
-                   int(request.form.get("interval", 2) or 0),
-                   float(request.form.get("undercut_pct", 0) or 0),
+                   int(request.form.get("interval", 60) or 60),
                    request.form.get("verbose", "1") != "0",
                    max(1, int(request.form.get("max_workers", 5) or 5)),
                    int(float(request.form.get("snipe_threshold", 700_000) or 700_000)))

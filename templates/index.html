@@ -222,6 +222,8 @@
                   <input type="text" name="item_id_or_name" required style="width:160px" placeholder="e.g. 194 or Mr. Accessory"></div>
                 <div class="field"><label>Snipe threshold (meat)</label>
                   <input type="number" name="snipe_threshold" value="700000" min="0" style="width:110px"></div>
+                <div class="field"><label>Undercut (meat)</label>
+                  <input type="number" name="undercut" placeholder="1000" min="0" style="width:90px"></div>
                 <button type="submit" class="btn-run">Add / Update</button>
               </div>
             </form>
@@ -240,6 +242,8 @@
                   <input type="number" name="max_price" placeholder="optional"></div>
                 <div class="field"><label>Buy qty</label>
                   <input type="number" name="buy_qty" value="1" min="1" class="narrow"></div>
+                <div class="field"><label>Undercut (meat)</label>
+                  <input type="number" name="undercut" placeholder="0" min="0" style="width:90px"></div>
                 <button type="submit" class="btn-run">Add / Update</button>
               </div>
             </form>
@@ -802,10 +806,11 @@ function loadSnipes() {
           '<td>' + s.item_id + '</td>' +
           '<td>' + (s.name || '') + '</td>' +
           '<td>' + (s.snipe_threshold || 700000).toLocaleString() + '</td>' +
+          '<td>' + (s.undercut ? s.undercut.toLocaleString() : (s.undercut === 0 ? '&mdash;' : '1,000')) + '</td>' +
           '<td><button class="btn-danger rm-snipe-btn" data-id="' + s.item_id + '" data-name="' + safeName + '" style="' + btnStyle + '">Remove</button></td>' +
           '</tr>';
       }).join('');
-      el.innerHTML = '<table class="rtable"><thead><tr><th>ID</th><th>Name</th><th>Threshold</th><th></th></tr></thead>' +
+      el.innerHTML = '<table class="rtable"><thead><tr><th>ID</th><th>Name</th><th>Threshold</th><th>Undercut</th><th></th></tr></thead>' +
         '<tbody>' + rows + '</tbody></table>';
     });
 }
@@ -862,6 +867,7 @@ function loadRanges() {
           '<td class="editable" data-field="min_price" data-value="' + (r.min_price != null ? r.min_price : '') + '">' + minDisp + '</td>' +
           '<td class="editable" data-field="max_price" data-value="' + (r.max_price != null ? r.max_price : '') + '">' + maxDisp + '</td>' +
           '<td class="editable" data-field="buy_qty"   data-value="' + (r.buy_qty || 1) + '">' + (r.buy_qty || 1) + '</td>' +
+          '<td class="editable" data-field="undercut"  data-value="' + (r.undercut != null ? r.undercut : 0) + '">' + (r.undercut ? r.undercut.toLocaleString() : '&mdash;') + '</td>' +
           '<td style="white-space:nowrap">' +
             '<button class="btn-run upd-range-btn" data-id="' + r.item_id + '" data-name="' + safeName + '" style="' + btnStyle + ';margin-right:.3rem">Update</button>' +
             '<button class="btn-danger rm-range-btn" data-id="' + r.item_id + '" data-name="' + safeName + '" style="' + btnStyle + '">Remove</button>' +
@@ -869,7 +875,7 @@ function loadRanges() {
           '</tr>';
       }).join('');
       el.innerHTML = '<table class="rtable"><thead><tr><th>ID</th><th>Name</th>' +
-        '<th>Buy Below</th><th>Sell Above</th><th>Buy Qty</th><th></th></tr></thead>' +
+        '<th>Buy Below</th><th>Sell Above</th><th>Buy Qty</th><th>Undercut</th><th></th></tr></thead>' +
         '<tbody>' + rows + '</tbody></table>';
     });
 }
@@ -923,12 +929,14 @@ document.addEventListener('click', function(e) {
 
   var body = new URLSearchParams();
   body.append('item_id_or_name', itemId);
-  var minVal = cellVal('min_price');
-  var maxVal = cellVal('max_price');
-  var qtyVal = cellVal('buy_qty');
+  var minVal      = cellVal('min_price');
+  var maxVal      = cellVal('max_price');
+  var qtyVal      = cellVal('buy_qty');
+  var undercutVal = cellVal('undercut');
   if (minVal) body.append('min_price', minVal);
   if (maxVal) body.append('max_price', maxVal);
-  body.append('buy_qty', qtyVal || '1');
+  body.append('buy_qty',  qtyVal      || '1');
+  body.append('undercut', undercutVal || '0');
 
   btn.disabled = true;
   fetch('/run/set_range', { method: 'POST', body: body })
